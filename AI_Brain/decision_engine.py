@@ -26,7 +26,7 @@ class DecisionEngine:
                 'trend': lstm_pred.item()
             }
 
-    def analyze_mtf(self, mtf_data, ai_mode="CONSERVATIVE", exploration_rate=0.0):
+    def analyze_mtf(self, mtf_data, ai_mode="CONSERVATIVE", exploration_rate=0.0, symbol="Unknown"):
         """
         mtf_data: { timeframe: (gaf_tensor, lstm_tensor) }
         Confluence Logic: 
@@ -93,8 +93,11 @@ class DecisionEngine:
 
         if m1:
             # 2. Confluence Logic
-            is_bullish = m1['class'] == 1 and m1['trend'] > 0
-            is_bearish = m1['class'] == 2 and m1['trend'] < 0
+            # Include all bullish patterns: 1(Bullish), 3(Hammer), 5(Engulfing), 7(Morning Star)
+            is_bullish = m1['class'] in [1, 3, 5, 7] and m1['trend'] > 0
+            
+            # Include all bearish patterns: 2(Bearish), 4(Shooting Star), 6(Engulfing), 8(Evening Star)
+            is_bearish = m1['class'] in [2, 4, 6, 8] and m1['trend'] < 0
             
             # Additional Trend Confirmation (Optional in Explorer)
             if ai_mode == "EXPLORER":
@@ -102,14 +105,14 @@ class DecisionEngine:
                 bull_confirmed = True if not (m5 or h1) else ((m5['trend'] > 0 if m5 else False) or (h1['trend'] > 0 if h1 else False))
                 bear_confirmed = True if not (m5 or h1) else ((m5['trend'] < 0 if m5 else False) or (h1['trend'] < 0 if h1 else False))
                 
-                # Confidence Threshold Relaxation
-                min_conf = 0.6
+                # Confidence Threshold Relaxation (Explorer: 0.65)
+                min_conf = 0.65
             else:
                 # Conservative remains strict: needs ALL
                 if not (m5 and h1): return signal
                 bull_confirmed = (m5['trend'] > 0 and h1['trend'] > 0)
                 bear_confirmed = (m5['trend'] < 0 and h1['trend'] < 0)
-                min_conf = 0.6
+                min_conf = 0.65
 
             # Generate Report Components
             pattern_text = pattern_names.get(m1['class'], "Unknown")
@@ -153,6 +156,8 @@ class DecisionEngine:
                 }
             else:
                 # Capture pattern detections even if no trade action is taken
+                if m1['conf'] < min_conf:
+                    logger.info(f"⚠️ Signal Skipped: {symbol} Pattern {pattern_text} | Conf {m1['conf']:.2f} < {min_conf}")
                 signal['analyst_metadata'] = analyst_data
                 signal['raw_cnn_class'] = m1['class']
                 signal['raw_lstm_trend'] = m1['trend']

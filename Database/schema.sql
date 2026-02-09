@@ -1,7 +1,7 @@
 -- Database Schema for Quant Trading System
 -- Optimized for Reinforcement Learning (RL)
 
--- 1. Drop Old Tables (As requested)
+-- 1. Drop Old Tables (Cleanup)
 
 -- 2. Create Tables
 
@@ -43,9 +43,22 @@ CREATE TABLE IF NOT EXISTS trade_logs (
     lstm_trend_pred DOUBLE PRECISION,
     lstm_confidence DOUBLE PRECISION,
     
-    -- Status
-    status TEXT DEFAULT 'OPEN' -- 'OPEN', 'CLOSED'
+    -- Status & Analytics
+    status TEXT DEFAULT 'OPEN', -- 'OPEN', 'CLOSED'
+    close_reason TEXT -- 'SL', 'TP', 'MANUAL', 'REVERSAL', etc.
 );
+
+-- Table: llm_training_logs (LLM Mentor Feedback for RL Training)
+CREATE TABLE IF NOT EXISTS llm_training_logs (
+    id SERIAL PRIMARY KEY,
+    trade_id INTEGER REFERENCES trade_logs(id),
+    quality_score INTEGER,
+    reasoning TEXT,
+    adjusted_reward DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+
 
 -- 3. Indexes for Performance
 CREATE INDEX IF NOT EXISTS idx_candles_time ON market_candles (time DESC);

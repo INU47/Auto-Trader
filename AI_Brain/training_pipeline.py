@@ -12,12 +12,13 @@ from datetime import datetime
 try:
     from preprocessor import GAFTransformer
     from models import PatternCNN, TrendLSTM
+    from llm_advisor import LLMRewardAdvisor
 except ImportError:
     from AI_Brain.preprocessor import GAFTransformer
     from AI_Brain.models import PatternCNN, TrendLSTM
+    from AI_Brain.llm_advisor import LLMRewardAdvisor
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure Logger
 logger = logging.getLogger("Trainer")
 
 # --- 1. Real Data Ingestion (MT5) ---
@@ -223,6 +224,7 @@ class QuantDataset(Dataset):
 # --- 3. Backtester ---
 class Backtester:
     def __init__(self, initial_balance=10000):
+        self.initial_balance = initial_balance
         self.balance = initial_balance
         self.equity = initial_balance
         self.trades = [] # {'type': 'BUY', 'entry': 1.0, 'exit': 1.1, 'pnl': 100}
@@ -488,14 +490,35 @@ class RLExperienceDataset(Dataset):
             torch.tensor(exp['reward'], dtype=torch.float32)
         )
 
-def train_rl_mode(experiences, epochs=10, lr=0.0001):
+async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001):
     """
-    Reinforcement Learning update based on actual trade outcomes.
-    Uses Policy Gradient: Loss = -log(prob(action)) * reward
+    Reinforcement Learning update with LLM Reward Shaping.
     """
     if not experiences:
         logger.warning("No experiences for RL training.")
         return
+
+    # 1. Reward Shaping with LLM Advisor
+    if advisor and db:
+        logger.info("Shaping rewards using LLM Advisor...")
+        for exp in experiences:
+            try:
+                # Get Score and Reasoning
+                score, reason = await advisor.get_quality_score(exp)
+                await asyncio.sleep(1) # Proactive throttling for free-tier quota
+                
+                # Formula: Adjusted = PnL * (Score / 50.0)
+                # 50 is neutral. 100 doubles reward. 0 nullifies reward.
+                raw_reward = exp['reward']
+                adjusted_reward = raw_reward * (score / 50.0)
+                
+                # Update Experience
+                exp['reward'] = adjusted_reward
+                
+                # Log to DB for audit
+                await db.log_llm_reward(exp['id'], score, reason, adjusted_reward)
+            except Exception as e:
+                logger.error(f"Reward shaping failed for trade {exp.get('id')}: {e}")
 
     logger.info(f"Starting RL Training session with {len(experiences)} samples...")
     
@@ -557,5 +580,6 @@ def train_rl_mode(experiences, epochs=10, lr=0.0001):
     logger.info("RL Training Complete. Weights updated.")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     train_and_backtest() 
     # run_backtest_only()

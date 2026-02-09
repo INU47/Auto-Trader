@@ -13,6 +13,7 @@
         "database": "quant_db"
     },
     "ai_mode": "EXPLORER",
-    "exploration_rate": 0.2,
-    "gemini_api_key": "AIzaSyANlX67pOl_tU5iAPIgQNPHKImOAlnhmHk"
+    "exploration_rate": 0.05,
+    "gemini_api_key": "AIzaSyDrE8SNKxz60q0hMvx5Q171VNB8CGQuO8E",
+    "gemini_model": "gemini-2.5-flash"
 }

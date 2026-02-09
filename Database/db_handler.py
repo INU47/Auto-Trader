@@ -169,7 +169,7 @@ class DBHandler:
             logger.error(f"Failed to log trade entry: {e}")
             return None
 
-    async def log_trade_exit(self, db_id, close_price, profit, net_profit):
+    async def log_trade_exit(self, db_id, close_price, profit, net_profit, reason="UNKNOWN"):
         """Updates the trade log with CLOSE details"""
         if not self.pool or not db_id: return
         try:
@@ -179,15 +179,35 @@ class DBHandler:
                     close_price = $1, 
                     gross_profit = $2, 
                     net_profit = $3, 
-                    status = 'CLOSED'
-                WHERE id = $4
+                    status = 'CLOSED',
+                    close_reason = $4
+                WHERE id = $5
             """
             async with self.pool.acquire() as conn:
-                await conn.execute(query, float(close_price), float(profit), float(net_profit), db_id)
+                await conn.execute(query, float(close_price), float(profit), float(net_profit), reason, db_id)
         except Exception as e:
             logger.error(f"Failed to log trade exit: {e}")
 
-    async def close_latest_trade(self, symbol, close_price, profit, net_profit):
+    async def log_trade_exit_by_ticket(self, ticket, close_price, profit, net_profit, reason="UNKNOWN"):
+        """Updates the trade log with CLOSE details using MT5 Ticket"""
+        if not self.pool or not ticket: return
+        try:
+            query = """
+                UPDATE trade_logs 
+                SET close_time = NOW(), 
+                    close_price = $1, 
+                    gross_profit = $2, 
+                    net_profit = $3, 
+                    status = 'CLOSED',
+                    close_reason = $4
+                WHERE ticket = $5 AND status = 'OPEN'
+            """
+            async with self.pool.acquire() as conn:
+                await conn.execute(query, float(close_price), float(profit), float(net_profit), reason, int(ticket))
+        except Exception as e:
+            logger.error(f"Failed to log trade exit by ticket: {e}")
+
+    async def close_latest_trade(self, symbol, close_price, profit, net_profit, reason="UNKNOWN"):
         """Closes the latest OPEN trade for a symbol (FIFO logic for RL logging)"""
         if not self.pool: return
         try:
@@ -200,7 +220,7 @@ class DBHandler:
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(find_query, symbol)
                 if row:
-                    await self.log_trade_exit(row['id'], close_price, profit, net_profit)
+                    await self.log_trade_exit(row['id'], close_price, profit, net_profit, reason=reason)
                 else:
                     logger.warning(f"No OPEN trade found to close for {symbol}")
         except Exception as e:
@@ -242,9 +262,9 @@ class DBHandler:
         try:
             experiences = []
             async with self.pool.acquire() as conn:
-                # 1. Get closed trades
+                # 1. Get closed trades with full context for LLM scoring
                 trades = await conn.fetch("""
-                    SELECT id, symbol, action, open_time, net_profit 
+                    SELECT id, symbol, action, open_price, close_price, pattern_type, cnn_confidence, open_time, net_profit 
                     FROM trade_logs 
                     WHERE status = 'CLOSED' 
                     ORDER BY open_time DESC LIMIT $1
@@ -264,9 +284,14 @@ class DBHandler:
                         # Reverse list to get chronological order (Oldest to Newest)
                         state_candles = [dict(c) for c in reversed(candles)]
                         experiences.append({
+                            'id': t['id'],
                             'symbol': t['symbol'],
                             'action': 1 if t['action'] == 'BUY' else 2,
                             'reward': float(t['net_profit'] or 0.0),
+                            'open_price': float(t['open_price'] or 0.0),
+                            'close_price': float(t['close_price'] or 0.0),
+                            'pattern_name': t['pattern_type'],
+                            'cnn_confidence': float(t['cnn_confidence'] or 0.0),
                             'state': state_candles
                         })
             
@@ -275,6 +300,21 @@ class DBHandler:
         except Exception as e:
             logger.error(f"Failed to fetch RL training data: {e}")
             return []
+
+    async def log_llm_reward(self, trade_id, quality_score, reasoning, adjusted_reward):
+        """Logs LLM mentorship feedback for training audit."""
+        if not self.pool: return
+        try:
+            query = """
+                INSERT INTO llm_training_logs (trade_id, quality_score, reasoning, adjusted_reward)
+                VALUES ($1, $2, $3, $4)
+            """
+            async with self.pool.acquire() as conn:
+                await conn.execute(query, trade_id, int(quality_score), reasoning, float(adjusted_reward))
+        except Exception as e:
+            logger.error(f"Failed to log LLM reward: {e}")
+
+
 
     async def close(self):
         if self.pool:
