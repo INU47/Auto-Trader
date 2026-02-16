@@ -5,7 +5,19 @@
 
 -- 2. Create Tables
 
--- Table: market_candles (Stores OHLCV for M1, M5, H1)
+-- Table: users (Stores multiple accounts)
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    mt5_login BIGINT NOT NULL,
+    mt5_password TEXT NOT NULL, -- Encrypted
+    mt5_server TEXT NOT NULL,
+    mt5_path TEXT, -- Custom path to MT5 terminal
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Table: market_candles (Shared across all users)
 CREATE TABLE IF NOT EXISTS market_candles (
     time TIMESTAMPTZ NOT NULL,
     symbol TEXT NOT NULL,
@@ -18,9 +30,10 @@ CREATE TABLE IF NOT EXISTS market_candles (
     PRIMARY KEY (time, symbol, timeframe)
 );
 
--- Table: trade_logs (Full Trade Lifecycle with Model State)
+-- Table: trade_logs (Full Trade Lifecycle with User Isolation)
 CREATE TABLE IF NOT EXISTS trade_logs (
     id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     ticket BIGINT, -- MT5 Ticket ID
     symbol TEXT NOT NULL,
     action TEXT NOT NULL, -- 'BUY' or 'SELL'
@@ -51,11 +64,21 @@ CREATE TABLE IF NOT EXISTS trade_logs (
 -- Table: llm_training_logs (LLM Mentor Feedback for RL Training)
 CREATE TABLE IF NOT EXISTS llm_training_logs (
     id SERIAL PRIMARY KEY,
-    trade_id INTEGER REFERENCES trade_logs(id),
+    trade_id INTEGER REFERENCES trade_logs(id) ON DELETE CASCADE,
     quality_score INTEGER,
     reasoning TEXT,
     adjusted_reward DOUBLE PRECISION,
+    is_exploration BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
+);
+    
+-- Table: system_metadata (Persistent Key-Value Store)
+CREATE TABLE IF NOT EXISTS system_metadata (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, -- NULL for global config
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    UNIQUE (user_id, key)
 );
 
 

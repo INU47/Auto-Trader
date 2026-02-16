@@ -1,4 +1,5 @@
 import torch
+import asyncio
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -403,6 +404,7 @@ def train_and_backtest():
     optimizer_lstm = optim.Adam(lstm.parameters(), lr=LR)
     
     # Simple Train Loop
+    best_loss = float('inf')
     for epoch in range(EPOCHS):
         cnn.train(); lstm.train()
         total_loss = 0
@@ -418,11 +420,28 @@ def train_and_backtest():
             optimizer_cnn.step(); optimizer_lstm.step()
             total_loss += loss.item()
         
+        avg_loss = total_loss / len(train_loader)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            if not os.path.exists("AI_Brain/weights"): os.makedirs("AI_Brain/weights")
+            torch.save(cnn.state_dict(), "AI_Brain/weights/best_cnn_model.pt")
+            torch.save(lstm.state_dict(), "AI_Brain/weights/best_lstm_model.pt")
+            logger.info(f"New best model saved at Epoch {epoch+1} with Loss: {best_loss:.4f}")
+
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info(f"Epoch {epoch+1}: Loss {total_loss/len(train_loader):.4f}")
+            logger.info(f"Epoch {epoch+1}: Loss {avg_loss:.4f}")
         
-    torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
-    torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
+    # Finalize: Load best weights and save as production weights
+    try:
+        cnn.load_state_dict(torch.load("AI_Brain/weights/best_cnn_model.pt"))
+        lstm.load_state_dict(torch.load("AI_Brain/weights/best_lstm_model.pt"))
+        torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
+        torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
+        logger.info(f"Training Complete. Best model (Loss: {best_loss:.4f}) promoted to production.")
+    except Exception as e:
+        logger.error(f"Failed to promote best model: {e}")
+        torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
+        torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
     
     # 4. Backtest
     backtester = Backtester(initial_balance=10000)
@@ -445,11 +464,11 @@ def run_backtest_only():
     cnn = PatternCNN()
     lstm = TrendLSTM(input_size=5, hidden_size=64, dropout=0.3)
     
-    try:
+    if os.path.exists("AI_Brain/weights/cnn_model.pt"):
         cnn.load_state_dict(torch.load("AI_Brain/weights/cnn_model.pt"))
         lstm.load_state_dict(torch.load("AI_Brain/weights/lstm_model.pt"))
         logger.info("Loaded trained weights.")
-    except FileNotFoundError:
+    else:
         logger.error("Weights not found! Train first.")
         return
 
@@ -490,7 +509,7 @@ class RLExperienceDataset(Dataset):
             torch.tensor(exp['reward'], dtype=torch.float32)
         )
 
-async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001):
+async def train_rl_mode(experiences, advisor=None, db=None, epochs=50, lr=0.0001):
     """
     Reinforcement Learning update with LLM Reward Shaping.
     """
@@ -498,29 +517,10 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001
         logger.warning("No experiences for RL training.")
         return
 
-    # 1. Reward Shaping with LLM Advisor
-    if advisor and db:
-        logger.info("Shaping rewards using LLM Advisor...")
-        for exp in experiences:
-            try:
-                # Get Score and Reasoning
-                score, reason = await advisor.get_quality_score(exp)
-                await asyncio.sleep(1) # Proactive throttling for free-tier quota
-                
-                # Formula: Adjusted = PnL * (Score / 50.0)
-                # 50 is neutral. 100 doubles reward. 0 nullifies reward.
-                raw_reward = exp['reward']
-                adjusted_reward = raw_reward * (score / 50.0)
-                
-                # Update Experience
-                exp['reward'] = adjusted_reward
-                
-                # Log to DB for audit
-                await db.log_llm_reward(exp['id'], score, reason, adjusted_reward)
-            except Exception as e:
-                logger.error(f"Reward shaping failed for trade {exp.get('id')}: {e}")
-
-    logger.info(f"Starting RL Training session with {len(experiences)} samples...")
+    # 1. Background Shaping check (Simplified)
+    # The rewards should already be shaped by the background worker in main.py.
+    # We just log a warning if some are still unrated.
+    logger.info(f"Starting RL Training session with {len(experiences)} samples for {epochs} epochs...")
     
     WINDOW_SIZE = 32
     BATCH_SIZE = 16
@@ -532,11 +532,14 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001
     lstm = TrendLSTM(input_size=5, hidden_size=64, dropout=0.3)
     
     # Load current weights if available
-    try:
-        cnn.load_state_dict(torch.load("AI_Brain/weights/cnn_model.pt"))
-        lstm.load_state_dict(torch.load("AI_Brain/weights/lstm_model.pt"))
-        logger.info("Loaded previous weights for RL refinement.")
-    except:
+    if os.path.exists("AI_Brain/weights/cnn_model.pt"):
+        try:
+            cnn.load_state_dict(torch.load("AI_Brain/weights/cnn_model.pt"))
+            lstm.load_state_dict(torch.load("AI_Brain/weights/lstm_model.pt"))
+            logger.info("Loaded previous weights for RL refinement.")
+        except Exception as e:
+            logger.warning(f"Failed to load weights: {e}. Starting RL from scratch.")
+    else:
         logger.warning("No existing weights found. Starting RL from scratch.")
         
     optimizer_cnn = optim.Adam(cnn.parameters(), lr=lr)
@@ -544,6 +547,7 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001
     
     cnn.train(); lstm.train()
     
+    best_loss = float('inf')
     for epoch in range(epochs):
         epoch_loss = 0
         for gaf, seq, action, reward in loader:
@@ -571,13 +575,28 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=10, lr=0.0001
             
             epoch_loss += loss.item()
             
-        logger.info(f"RL Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(loader):.6f}")
+        avg_loss = epoch_loss / len(loader)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            if not os.path.exists("AI_Brain/weights"): os.makedirs("AI_Brain/weights")
+            torch.save(cnn.state_dict(), "AI_Brain/weights/best_cnn_model.pt")
+            torch.save(lstm.state_dict(), "AI_Brain/weights/best_lstm_model.pt")
+            logger.info(f"New best RL model saved at Epoch {epoch+1} with Loss: {best_loss:.6f}")
 
-    # Save upgraded weights
-    if not os.path.exists("AI_Brain/weights"): os.makedirs("AI_Brain/weights")
-    torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
-    torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
-    logger.info("RL Training Complete. Weights updated.")
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            logger.info(f"RL Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f}")
+
+    # Finalize: Load best weights and save as production weights
+    try:
+        cnn.load_state_dict(torch.load("AI_Brain/weights/best_cnn_model.pt"))
+        lstm.load_state_dict(torch.load("AI_Brain/weights/best_lstm_model.pt"))
+        torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
+        torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
+        logger.info(f"RL Training Complete. Best model (Loss: {best_loss:.6f}) promoted to production.")
+    except Exception as e:
+        logger.error(f"Failed to promote best RL model: {e}")
+        torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
+        torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

@@ -208,7 +208,8 @@
         }
 
         const chartElement = document.getElementById('chart-container');
-        const chart = LightweightCharts.createChart(chartElement, {
+        const { createChart, CandlestickSeries, AreaSeries } = LightweightCharts;
+        const chart = createChart(chartElement, {
             width: chartElement.clientWidth,
             height: chartElement.clientHeight,
             layout: {
@@ -235,7 +236,7 @@
             },
         });
 
-        const candleSeries = chart.addCandlestickSeries({
+        const candleSeries = chart.addSeries(CandlestickSeries, {
             upColor: '#26a69a',
             downColor: '#ef5350',
             borderVisible: false,
@@ -243,7 +244,8 @@
             wickDownColor: '#ef5350',
         });
 
-        const areaSeries = chart.addAreaSeries({
+        // Series for bounding boxes (overlays)
+        const areaSeries = chart.addSeries(AreaSeries, {
             lineColor: 'rgba(88, 166, 255, 0.5)',
             topColor: 'rgba(88, 166, 255, 0.2)',
             bottomColor: 'rgba(88, 166, 255, 0)',

@@ -1,3 +1,15 @@
+performance_log.txt
+Config/*.json
+AI_Brain/weights/*.pt
+AI_Brain/weights/*/
+node_modules/
+dist/
+/find_mt5_*.py
+/diag_lots.py
+Database/fix_*.py
+Database/verify_*.py
+Database/bootstrap_*.py
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

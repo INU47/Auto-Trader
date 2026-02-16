@@ -47,6 +47,8 @@ class TelegramNotifier:
                 
                 if resp.status_code != 200:
                     logger.error(f"Telegram API Error: {resp.text}")
+        except (httpx.ConnectTimeout, httpx.ConnectError):
+            logger.warning(f"Telegram connection timed out: {text[:50]}...")
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {e}")
 
@@ -54,9 +56,7 @@ class TelegramNotifier:
         """Returns a standard button layout for the bot"""
         return {
             "keyboard": [
-                [{"text": "/status"}, {"text": "/stats"}],
-                [{"text": "/history"}, {"text": "/help"}],
-                [{"text": "/test_buy"}, {"text": "/test_sell"}],
+                [{"text": "/info"}, {"text": "/history"}],
                 [{"text": "/on"}, {"text": "/off"}]
             ],
             "resize_keyboard": True,
@@ -87,8 +87,8 @@ class TelegramNotifier:
                             if from_id == self.chat_id and text:
                                 new_cmds.append(text.lower().strip())
                         return new_cmds
-        except httpx.ReadTimeout:
-            pass # Common and harmless for long polling
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError):
+            pass # Transient network issues are common and harmless
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 409:
                 logger.error("Telegram Conflict (409): Another instance is likely running. Close other terminal windows.")

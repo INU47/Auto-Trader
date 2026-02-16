@@ -106,9 +106,12 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 # Serve Frontend
-static_path = os.path.join(os.path.dirname(__file__), "static")
+static_path = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 if not os.path.exists(static_path):
-    os.makedirs(static_path)
+    # Fallback to legacy static if React build not found
+    static_path = os.path.join(os.path.dirname(__file__), "static")
+    if not os.path.exists(static_path):
+        os.makedirs(static_path)
 
 app.mount("/", StaticFiles(directory=static_path, html=True), name="static")
 

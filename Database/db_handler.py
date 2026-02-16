@@ -61,7 +61,13 @@ class DBHandler:
                 
                 async with self.pool.acquire() as conn:
                     await conn.execute(schema_sql)
-                logger.info("Database schema verified/initialized.")
+                    
+                    # Phase 93: Data Migration (Add user_id if missing)
+                    await conn.execute("ALTER TABLE trade_logs ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+                    await conn.execute("ALTER TABLE system_metadata ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+                    # Migrate system_metadata keys if necessary (optional here)
+                    
+                logger.info("Database schema verified/initialized/migrated.")
         except Exception as e:
             logger.error(f"Failed to initialize schema: {e}")
 
@@ -131,18 +137,18 @@ class DBHandler:
         except Exception as e:
             logger.error(f"Failed to log candle batch: {e}")
 
-    async def log_trade_entry(self, symbol, action, lot_size, price, signal_data, ticket=0):
+    async def log_trade_entry(self, user_id, symbol, action, lot_size, price, signal_data, ticket=0):
         """
-        Logs the OPENING of a trade. 
-        Returns the database ID of the log entry to be used for closing later.
+        Logs the OPENING of a trade for a specific user. 
+        Returns the database ID of the log entry.
         """
         if not self.pool: return None
         try:
             query = """
                 INSERT INTO trade_logs (
-                    open_time, symbol, action, open_price, lot_size,
+                    user_id, open_time, symbol, action, open_price, lot_size,
                     ai_mode, pattern_type, cnn_confidence, lstm_trend_pred, lstm_confidence, status, ticket
-                ) VALUES (NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9, 'OPEN', $10)
+                ) VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9, $10, 'OPEN', $11)
                 RETURNING id
             """
             
@@ -154,11 +160,12 @@ class DBHandler:
             
             async with self.pool.acquire() as conn:
                 row = await conn.fetchrow(query, 
+                                          user_id,
                                           symbol, 
                                           action, 
                                           float(price), 
                                           float(lot_size),
-                                          ai_mode,  # Use actual mode instead of hardcoded
+                                          ai_mode,
                                           str(raw_pattern),
                                           float(signal_data.get('confidence', 0.0)),
                                           float(raw_trend),
@@ -188,8 +195,8 @@ class DBHandler:
         except Exception as e:
             logger.error(f"Failed to log trade exit: {e}")
 
-    async def log_trade_exit_by_ticket(self, ticket, close_price, profit, net_profit, reason="UNKNOWN"):
-        """Updates the trade log with CLOSE details using MT5 Ticket"""
+    async def log_trade_exit_by_ticket(self, user_id, ticket, close_price, profit, net_profit, reason="UNKNOWN"):
+        """Updates the trade log with CLOSE details using MT5 Ticket and User ID"""
         if not self.pool or not ticket: return
         try:
             query = """
@@ -200,58 +207,100 @@ class DBHandler:
                     net_profit = $3, 
                     status = 'CLOSED',
                     close_reason = $4
-                WHERE ticket = $5 AND status = 'OPEN'
+                WHERE user_id = $5 AND ticket = $6 AND status = 'OPEN'
             """
             async with self.pool.acquire() as conn:
-                await conn.execute(query, float(close_price), float(profit), float(net_profit), reason, int(ticket))
+                await conn.execute(query, float(close_price), float(profit), float(net_profit), reason, user_id, int(ticket))
         except Exception as e:
-            logger.error(f"Failed to log trade exit by ticket: {e}")
+            logger.error(f"Failed to log trade exit by ticket (User: {user_id}): {e}")
 
-    async def close_latest_trade(self, symbol, close_price, profit, net_profit, reason="UNKNOWN"):
-        """Closes the latest OPEN trade for a symbol (FIFO logic for RL logging)"""
+    async def close_latest_trade(self, user_id, symbol, close_price, profit, net_profit, reason="UNKNOWN"):
+        """Closes the latest OPEN trade for a user/symbol (FIFO logic)"""
         if not self.pool: return
         try:
-            # Find the latest OPEN trade for this symbol
+            # Find the latest OPEN trade for this user and symbol
             find_query = """
                 SELECT id FROM trade_logs 
-                WHERE symbol = $1 AND status = 'OPEN' 
+                WHERE user_id = $1 AND symbol = $2 AND status = 'OPEN' 
                 ORDER BY open_time DESC LIMIT 1
             """
             async with self.pool.acquire() as conn:
-                row = await conn.fetchrow(find_query, symbol)
+                row = await conn.fetchrow(find_query, user_id, symbol)
                 if row:
                     await self.log_trade_exit(row['id'], close_price, profit, net_profit, reason=reason)
                 else:
-                    logger.warning(f"No OPEN trade found to close for {symbol}")
+                    logger.warning(f"No OPEN trade found to close for {symbol} (User: {user_id})")
         except Exception as e:
-            logger.error(f"Failed to close latest trade: {e}")
+            logger.error(f"Failed to close latest trade (User: {user_id}): {e}")
 
-    async def get_recent_signals(self, limit=5):
+    async def count_total_trades(self, user_id=None):
+        """Returns the total number of trades (Global or Per-User)."""
+        if not self.pool: return 0
+        try:
+            async with self.pool.acquire() as conn:
+                if user_id:
+                    return await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE user_id = $1", user_id)
+                return await conn.fetchval("SELECT COUNT(*) FROM trade_logs")
+        except Exception as e:
+            logger.error(f"Failed to count total trades: {e}")
+            return 0
+
+    async def get_recent_signals(self, limit=5, offset=0, user_id=None):
         if not self.pool: return []
         try:
-            # Migration: ai_signals -> trade_logs
-            query = """
+            where_clause = "WHERE user_id = $3" if user_id else ""
+            query = f"""
                 SELECT open_time as time, symbol, action as final_signal, cnn_confidence 
                 FROM trade_logs 
-                ORDER BY open_time DESC LIMIT $1
+                {where_clause}
+                ORDER BY open_time DESC LIMIT $1 OFFSET $2
             """
             async with self.pool.acquire() as conn:
-                rows = await conn.fetch(query, limit)
+                if user_id:
+                    rows = await conn.fetch(query, limit, offset, user_id)
+                else:
+                    rows = await conn.fetch(query, limit, offset)
                 return rows
         except Exception as e:
             logger.error(f"Failed to fetch recent signals: {e}")
             return []
 
-    async def count_closed_trades(self):
-        """Returns the total number of CLOSED trades in the system."""
+    async def count_closed_trades(self, user_id=None):
         if not self.pool: return 0
         try:
             async with self.pool.acquire() as conn:
-                count = await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE status = 'CLOSED'")
-                return count
+                if user_id:
+                    return await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE status = 'CLOSED' AND user_id = $1", user_id)
+                return await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE status = 'CLOSED'")
         except Exception as e:
             logger.error(f"Failed to count closed trades: {e}")
             return 0
+
+    async def count_open_trades(self, user_id=None):
+        if not self.pool: return 0
+        try:
+            async with self.pool.acquire() as conn:
+                if user_id:
+                    return await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE status = 'OPEN' AND user_id = $1", user_id)
+                return await conn.fetchval("SELECT COUNT(*) FROM trade_logs WHERE status = 'OPEN'")
+        except Exception as e:
+            logger.error(f"Failed to count open trades: {e}")
+            return 0
+
+    async def get_open_positions(self, user_id):
+        """Returns all OPEN positions for a specific user."""
+        if not self.pool: return []
+        try:
+            query = """
+                SELECT id, symbol, ticket, open_price, lot_size, action 
+                FROM trade_logs 
+                WHERE user_id = $1 AND status = 'OPEN'
+            """
+            async with self.pool.acquire() as conn:
+                return await conn.fetch(query, user_id)
+        except Exception as e:
+            logger.error(f"Failed to get open positions for user {user_id}: {e}")
+            return []
 
     async def get_rl_training_data(self, limit=1000, window_size=32):
         """
@@ -262,12 +311,15 @@ class DBHandler:
         try:
             experiences = []
             async with self.pool.acquire() as conn:
-                # 1. Get closed trades with full context for LLM scoring
+                # 1. Get closed trades with LLM-Adjusted rewards if available
                 trades = await conn.fetch("""
-                    SELECT id, symbol, action, open_price, close_price, pattern_type, cnn_confidence, open_time, net_profit 
-                    FROM trade_logs 
-                    WHERE status = 'CLOSED' 
-                    ORDER BY open_time DESC LIMIT $1
+                    SELECT t.id, t.symbol, t.action, t.open_price, t.close_price, 
+                           t.pattern_type, t.cnn_confidence, t.open_time,
+                           COALESCE(l.adjusted_reward, t.net_profit) as final_reward
+                    FROM trade_logs t
+                    LEFT JOIN llm_training_logs l ON l.trade_id = t.id
+                    WHERE t.status = 'CLOSED' 
+                    ORDER BY t.open_time DESC LIMIT $1
                 """, limit)
                 
                 for t in trades:
@@ -287,7 +339,7 @@ class DBHandler:
                             'id': t['id'],
                             'symbol': t['symbol'],
                             'action': 1 if t['action'] == 'BUY' else 2,
-                            'reward': float(t['net_profit'] or 0.0),
+                            'reward': float(t['final_reward'] or 0.0),
                             'open_price': float(t['open_price'] or 0.0),
                             'close_price': float(t['close_price'] or 0.0),
                             'pattern_name': t['pattern_type'],
@@ -299,6 +351,52 @@ class DBHandler:
             return experiences
         except Exception as e:
             logger.error(f"Failed to fetch RL training data: {e}")
+            return []
+
+    async def get_unrated_trades(self, limit=5, window_size=32):
+        """
+        Fetches CLOSED trades that haven't been scored by LLM yet.
+        """
+        if not self.pool: return []
+        try:
+            unrated = []
+            async with self.pool.acquire() as conn:
+                # Find trades where status='CLOSED' and no entry in llm_training_logs
+                query = """
+                    SELECT id, symbol, action, open_price, close_price, pattern_type, cnn_confidence, open_time, net_profit 
+                    FROM trade_logs t
+                    WHERE status = 'CLOSED' 
+                      AND NOT EXISTS (SELECT 1 FROM llm_training_logs l WHERE l.trade_id = t.id)
+                    ORDER BY open_time ASC LIMIT $1
+                """
+                trades = await conn.fetch(query, limit)
+                
+                for t in trades:
+                    # Reconstruct state for the advisor
+                    candles = await conn.fetch("""
+                        SELECT open, high, low, close, volume as tick_volume
+                        FROM market_candles
+                        WHERE symbol = $1 AND timeframe = 'M1' AND time < $2
+                        ORDER BY time DESC LIMIT $3
+                    """, t['symbol'], t['open_time'], window_size)
+                    
+                    if len(candles) == window_size:
+                        state_candles = [dict(c) for c in reversed(candles)]
+                        unrated.append({
+                            'id': t['id'],
+                            'symbol': t['symbol'],
+                            'action': 1 if t['action'] == 'BUY' else 2,
+                            'reward': float(t['net_profit'] or 0.0),
+                            'open_price': float(t['open_price'] or 0.0),
+                            'close_price': float(t['close_price'] or 0.0),
+                            'pattern_name': t['pattern_type'],
+                            'cnn_confidence': float(t['cnn_confidence'] or 0.0),
+                            'net_profit': float(t['net_profit'] or 0.0),
+                            'state': state_candles
+                        })
+            return unrated
+        except Exception as e:
+            logger.error(f"Failed to fetch unrated trades: {e}")
             return []
 
     async def log_llm_reward(self, trade_id, quality_score, reasoning, adjusted_reward):
@@ -315,6 +413,68 @@ class DBHandler:
             logger.error(f"Failed to log LLM reward: {e}")
 
 
+
+    # User Management (Phase 93)
+    
+    async def get_or_create_user(self, username, mt5_login, mt5_password, mt5_server, mt5_path=None):
+        """Ensures a user exists and returns their user_id."""
+        if not self.pool: return None
+        try:
+            query = """
+                INSERT INTO users (username, mt5_login, mt5_password, mt5_server, mt5_path)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (username) DO UPDATE 
+                SET mt5_login = EXCLUDED.mt5_login, 
+                    mt5_password = EXCLUDED.mt5_password,
+                    mt5_server = EXCLUDED.mt5_server,
+                    mt5_path = EXCLUDED.mt5_path
+                RETURNING id
+            """
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(query, username, int(mt5_login), str(mt5_password), mt5_server, mt5_path)
+                return row['id'] if row else None
+        except Exception as e:
+            logger.error(f"Failed to get/create user {username}: {e}")
+            return None
+
+    async def get_active_users(self):
+        """Returns all active users for the orchestrator."""
+        if not self.pool: return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("SELECT * FROM users WHERE is_active = TRUE")
+                return rows
+        except Exception as e:
+            logger.error(f"Failed to fetch active users: {e}")
+            return []
+
+    async def get_metadata(self, key, user_id=None, default=None):
+        """Fetches a persistent property (Global or Per-User)."""
+        if not self.pool: return default
+        try:
+            async with self.pool.acquire() as conn:
+                if user_id:
+                    val = await conn.fetchval("SELECT value FROM system_metadata WHERE key = $1 AND user_id = $2", key, user_id)
+                else:
+                    val = await conn.fetchval("SELECT value FROM system_metadata WHERE key = $1 AND user_id IS NULL", key)
+                return val if val is not None else default
+        except Exception as e:
+            logger.error(f"Failed to fetch metadata {key} (User: {user_id}): {e}")
+            return default
+
+    async def set_metadata(self, key, value, user_id=None):
+        """Stores or updates a persistent property (Global or Per-User)."""
+        if not self.pool: return
+        try:
+            query = """
+                INSERT INTO system_metadata (key, value, user_id) VALUES ($1, $2, $3)
+                ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value
+            """
+            # Adjust mapping for NULL if user_id is None
+            async with self.pool.acquire() as conn:
+                await conn.execute(query, key, str(value), user_id)
+        except Exception as e:
+            logger.error(f"Failed to set metadata {key} (User: {user_id}): {e}")
 
     async def close(self):
         if self.pool:

@@ -1,6 +1,7 @@
 import logging
 import torch
 import numpy as np
+import math
 
 logger = logging.getLogger("DecisionEngine")
 
@@ -106,7 +107,7 @@ class DecisionEngine:
                 bear_confirmed = True if not (m5 or h1) else ((m5['trend'] < 0 if m5 else False) or (h1['trend'] < 0 if h1 else False))
                 
                 # Confidence Threshold Relaxation (Explorer: 0.65)
-                min_conf = 0.65
+                min_conf = 0.6
             else:
                 # Conservative remains strict: needs ALL
                 if not (m5 and h1): return signal
@@ -185,15 +186,15 @@ class RiskManager:
     def __init__(self, risk_per_trade=0.01):
         self.risk_per_trade = risk_per_trade 
 
-    def calculate_sl_tp(self, symbol, action, entry_price, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001):
+    def calculate_sl_tp(self, symbol, action, entry_price, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001, commission_buffer_pips=2.0):
         """Calculates precise price levels for SL and TP based on pips and tick_size"""
-        # Determine pip size (Standard pip = 10 * point for 5-digit brokers)
-        # For JPY/XAU, point is usually 0.01 or 0.001. 
-        # A 'pip' is generally 10 points on 5-digit brokers.
-        pip_value = 10 * point
+        # Phase 87: Handle JPY pairs (usually 3 decimal places, pip is 0.01)
+        is_jpy = "JPY" in symbol.upper()
+        pip_value = 0.01 if is_jpy else (10 * point)
         
         sl_offset = stop_loss_pips * pip_value
-        tp_offset = sl_offset * reward_ratio
+        # TP includes the buffer to ensure net profit after commission
+        tp_offset = (sl_offset * reward_ratio) + (commission_buffer_pips * pip_value)
         
         if action.upper() == "BUY":
             sl = entry_price - sl_offset
@@ -208,17 +209,51 @@ class RiskManager:
             
         return normalize(sl), normalize(tp)
 
-    def calculate_lot_size(self, account_equity, stop_loss_pips, confidence=0.5, pip_value=10):
+    def calculate_lot_size(self, account_equity, stop_loss_pips, confidence=0.5, pip_value=0.0001, commission_per_lot=7.0):
         if stop_loss_pips <= 0: return 0.01
         
-        # Dynamic Sizing: Scale risk based on confidence
-        # Base Risk: 1%
-        # If Confidence > 0.8: Risk -> 1.5%
-        # If Confidence < 0.6: Risk -> 0.5%
-        
-        confidence_factor = max(0.5, min(1.5, confidence / 0.7)) # Normalize around 0.7
+        # Dynamic Risk Scaling
+        confidence_factor = max(0.5, min(1.5, confidence / 0.7)) 
         adjusted_risk = self.risk_per_trade * confidence_factor
         
         risk_amount = account_equity * adjusted_risk
-        raw_lots = risk_amount / (stop_loss_pips * pip_value)
-        return round(raw_lots, 2)
+        
+        # Lot Calculation with Commission Compensation
+        denominator = (stop_loss_pips * pip_value) + commission_per_lot
+        raw_lots = risk_amount / denominator if denominator > 0 else 0.01
+        
+        return round(max(0.01, raw_lots), 2)
+
+    def calculate_max_affordable_lots(self, symbol, action, free_margin, mt5_module=None):
+        """
+        Calculates the maximum lot size that can be opened with available free margin.
+        A safety buffer of 10% is applied to avoid margin calls immediately after entry.
+        """
+        if mt5_module is None:
+            import MetaTrader5 as mt5_module
+
+        # Start with a reasonable upper bound to check margin (e.g., 100.0 lots)
+        # However, it's better to calculate margin for 1.0 lot and then divide.
+        order_type = mt5_module.ORDER_TYPE_BUY if action.upper() == "BUY" else mt5_module.ORDER_TYPE_SELL
+        
+        # Get margin required for 1.0 lot
+        margin_per_lot = mt5_module.order_calc_margin(order_type, symbol, 1.0, mt5_module.symbol_info_tick(symbol).ask)
+        
+        if margin_per_lot is None or margin_per_lot <= 0:
+            logger.warning(f"Could not calculate margin for {symbol}. Falling back to 0.01 lots.")
+            return 0.01
+
+        # Use 90% of free margin as a safety buffer
+        affordable_margin = free_margin * 0.9
+        max_lots = affordable_margin / margin_per_lot
+        
+        # Round down to 2 decimal places to be safe
+        max_lots = math.floor(max_lots * 100) / 100.0
+        
+        # Standardize to symbol limits
+        symbol_info = mt5_module.symbol_info(symbol)
+        if symbol_info:
+            max_lots = min(max_lots, symbol_info.volume_max)
+            max_lots = max(max_lots, symbol_info.volume_min)
+            
+        return round(max_lots, 2)
