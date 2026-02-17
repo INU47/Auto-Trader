@@ -35,16 +35,16 @@ class DecisionEngine:
         - EXPLORER: Entry on M1 IF confirmed by M5 OR H1.
         """
         pattern_names = {
-            0: "การพักฐาน / ไซด์เวย์ (Neutral/Consolidation)",
-            1: "แรงซื้อสะสม / ขาขึ้น (Bullish Momentum)",
-            2: "แรงขายกระจาย / ขาลง (Bearish Momentum)",
-            3: "Hammer (Bullish Pin Bar) - สัญญาณกลับตัวจากแนวรับ",
-            4: "Shooting Star (Bearish Pin Bar) - สัญญาณกลับตัวจากแนวต้าน",
-            5: "Bullish Engulfing - การกลืนกินขาขึ้น (Strong Buy Reversal)",
-            6: "Bearish Engulfing - การกลืนกินขาลง (Strong Sell Reversal)",
-            7: "Morning Star - การกลับตัวจากระดับต่ำสุด",
-            8: "Evening Star - การกลับตัวจากระดับสูงสุด",
-            9: "Doji - ตลาดลังเลใจ (Indecision / Pivot Point)"
+            0: "Neutral / Consolidation",
+            1: "Bullish Momentum",
+            2: "Bearish Momentum",
+            3: "Hammer (Bullish Pin Bar) - Bullish Reversal",
+            4: "Shooting Star (Bearish Pin Bar) - Bearish Reversal",
+            5: "Bullish Engulfing - Strong Bullish Reversal",
+            6: "Bearish Engulfing - Strong Bearish Reversal",
+            7: "Morning Star - Bullish Reversal Pattern",
+            8: "Evening Star - Bearish Reversal Pattern",
+            9: "Doji - Indecision / Pivot Point"
         }
         
         results = {}

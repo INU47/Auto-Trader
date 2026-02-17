@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { createChart, CrosshairMode, CandlestickSeries } from 'lightweight-charts';
+import { createChart, CrosshairMode, CandlestickSeries, ColorType } from 'lightweight-charts';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, ResponsiveContainer, AreaChart, Area
 } from 'recharts';
@@ -12,12 +12,18 @@ const App = () => {
   const [currentSymbol, setCurrentSymbol] = useState('EURUSD');
   const [currentTimeframe, setCurrentTimeframe] = useState('M1');
   const [price, setPrice] = useState(0);
-  const [signal, setSignal] = useState('WAITING...');
+  const [signal, setSignal] = useState('HOLD');
   const [analysis, setAnalysis] = useState('Waiting for AI signal...');
+  const [isDataLoaded, setIsDataLoaded] = useState(false);
   const [wsStatus, setWsStatus] = useState('disconnected');
   const [equityData, setEquityData] = useState([]);
   const [detections, setDetections] = useState([]);
   const [activeUsers, setActiveUsers] = useState(['master_trader']);
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
 
   const chartContainerRef = useRef(null);
   const candleSeriesRef = useRef(null);
@@ -26,54 +32,68 @@ const App = () => {
 
   // Initialize Lightweight Charts
   useEffect(() => {
-    if (!chartContainerRef.current) return;
+    if (!isMounted || !chartContainerRef.current) return;
 
-    const chart = createChart(chartContainerRef.current, {
-      width: chartContainerRef.current.clientWidth,
-      height: 500,
-      layout: {
-        backgroundColor: '#161b22',
-        textColor: '#c9d1d9',
-      },
-      grid: {
-        vertLines: { color: '#21262d' },
-        horzLines: { color: '#21262d' },
-      },
-      crosshair: {
-        mode: CrosshairMode.Normal,
-      },
-      rightPriceScale: {
-        borderColor: '#30363d',
-      },
-      timeScale: {
-        borderColor: '#30363d',
-        timeVisible: true,
-        secondsVisible: false,
-      },
-    });
+    // Increased delay to ensure container dimensions are calculated
+    const timer = setTimeout(() => {
+      if (!chartContainerRef.current) return;
 
-    const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#26a69a',
-      downColor: '#ef5350',
-      borderVisible: false,
-      wickUpColor: '#26a69a',
-      wickDownColor: '#ef5350',
-    });
+      const chart = createChart(chartContainerRef.current, {
+        autoSize: true,
+        layout: {
+          background: { type: ColorType.Solid, color: '#161b22' },
+          textColor: '#c9d1d9',
+        },
+        grid: {
+          vertLines: { color: '#21262d' },
+          horzLines: { color: '#21262d' },
+        },
+        crosshair: {
+          mode: CrosshairMode.Normal,
+        },
+        rightPriceScale: {
+          borderColor: '#30363d',
+        },
+        timeScale: {
+          borderColor: '#30363d',
+          timeVisible: true,
+          secondsVisible: false,
+          fixRightEdge: true,
+          rightOffset: 0,
+        },
+      });
 
-    chartRef.current = chart;
-    candleSeriesRef.current = candleSeries;
+      const candleSeriesOptions = {
+        upColor: '#26a69a',
+        downColor: '#ef5350',
+        borderVisible: false,
+        wickUpColor: '#26a69a',
+        wickDownColor: '#ef5350',
+      };
 
-    const handleResize = () => {
-      chart.applyOptions({ width: chartContainerRef.current.clientWidth });
-    };
+      const candleSeries = chart.addCandlestickSeries ?
+        chart.addCandlestickSeries(candleSeriesOptions) :
+        chart.addSeries(CandlestickSeries, candleSeriesOptions);
 
-    window.addEventListener('resize', handleResize);
+      chartRef.current = chart;
+      candleSeriesRef.current = candleSeries;
+
+      // No need for manual resize listener with autoSize: true
+      // const handleResize = () => {
+      //   chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+      // };
+      // window.addEventListener('resize', handleResize);
+
+    }, 500);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
-      chart.remove();
+      clearTimeout(timer);
+      if (chartRef.current) {
+        chartRef.current.remove();
+        chartRef.current = null;
+      }
     };
-  }, []);
+  }, [isMounted]);
 
   // Update chart when symbol/timeframe changes
   useEffect(() => {
@@ -127,16 +147,26 @@ const App = () => {
         allDataRef.current = newAllData;
         setEquityData(prev => [...prev, ...newEquity]);
 
+        // Set initial state from history
+        const currentKey = `${currentSymbol}_${currentTimeframe}`;
+        if (newAllData[currentKey] && newAllData[currentKey].length > 0) {
+          const lastCandle = newAllData[currentKey][newAllData[currentKey].length - 1];
+          setPrice(lastCandle.close);
+        }
+
         // Trigger chart update
         const key = `${currentSymbol}_${currentTimeframe}`;
         if (candleSeriesRef.current && newAllData[key]) {
           candleSeriesRef.current.setData(newAllData[key]);
+          chartRef.current.timeScale().fitContent();
+          setIsDataLoaded(true);
         }
       }
 
       if (msg.type === 'candle' || msg.type === 'tick') {
         const item = msg;
-        const key = `${item.symbol}_${item.timeframe}`;
+        const timeframe = item.timeframe || 'M1';
+        const key = `${item.symbol}_${timeframe}`;
         const candle = {
           time: item.time,
           open: parseFloat(item.open),
@@ -156,8 +186,10 @@ const App = () => {
         }
 
         // Live update chart if active
-        if (item.symbol === currentSymbol && item.timeframe === currentTimeframe && candleSeriesRef.current) {
-          candleSeriesRef.current.update(candle);
+        if (item.symbol === currentSymbol && timeframe === currentTimeframe) {
+          if (candleSeriesRef.current) {
+            candleSeriesRef.current.update(candle);
+          }
           setPrice(candle.close);
         }
       }
@@ -243,6 +275,26 @@ const App = () => {
         </div>
       </header>
 
+      {/* Loading Overlay */}
+      {!isDataLoaded && (
+        <div className="fixed inset-0 z-[100] bg-github-bg/90 backdrop-blur-md flex flex-col items-center justify-center">
+          <div className="relative">
+            <div className="w-24 h-24 border-2 border-github-accent/20 rounded-full animate-ping absolute inset-0"></div>
+            <div className="w-24 h-24 border-t-2 border-github-accent rounded-full animate-spin"></div>
+            <Cpu className="w-10 h-10 text-github-accent absolute top-7 left-7 animate-pulse" />
+          </div>
+          <div className="mt-8 flex flex-col items-center gap-2">
+            <h2 className="text-xl font-bold tracking-[0.2em] text-github-text">SYNCING HISTORICAL DATA</h2>
+            <div className="flex gap-1">
+              <span className="w-1.5 h-1.5 bg-github-accent rounded-full animate-bounce [animation-delay:-0.3s]"></span>
+              <span className="w-1.5 h-1.5 bg-github-accent rounded-full animate-bounce [animation-delay:-0.15s]"></span>
+              <span className="w-1.5 h-1.5 bg-github-accent rounded-full animate-bounce"></span>
+            </div>
+            <p className="text-github-text/40 text-xs font-mono mt-4 uppercase tracking-widest">Verifying market integrity...</p>
+          </div>
+        </div>
+      )}
+
       {/* Main Content */}
       <main className="flex-1 flex overflow-hidden p-4 gap-4">
         {/* Left Column: Charts */}
@@ -253,35 +305,37 @@ const App = () => {
               <span className="text-sm font-semibold">{currentSymbol}</span>
               <span className="text-xs text-github-text/60">({currentTimeframe})</span>
             </div>
-            <div ref={chartContainerRef} className="w-full h-[500px] rounded-lg overflow-hidden"></div>
+            <div ref={chartContainerRef} className="w-full h-[500px] rounded-lg overflow-hidden" style={{ minHeight: '500px' }}></div>
           </div>
 
           {/* Performance Charts Area */}
           <div className="grid grid-cols-2 gap-4 h-64">
-            <div className="bg-github-panel border border-github-border rounded-xl p-4 flex flex-col">
+            <div className="bg-github-panel border border-github-border rounded-xl p-4 flex flex-col min-w-0 overflow-hidden">
               <div className="flex items-center gap-2 mb-3">
                 <TrendingUp className="text-github-success w-4 h-4" />
                 <h3 className="text-xs font-bold uppercase tracking-wider text-github-text/50">Performance Overview</h3>
               </div>
-              <div className="flex-1 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={equityData}>
-                    <defs>
-                      <linearGradient id="colorProfit" x1="0" y1="0" x2="0" y2="1">
-                        <stop offset="5%" stopColor="#58a6ff" stopOpacity={0.3} />
-                        <stop offset="95%" stopColor="#58a6ff" stopOpacity={0} />
-                      </linearGradient>
-                    </defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false} />
-                    <XAxis dataKey="time" hide />
-                    <YAxis hide domain={['auto', 'auto']} />
-                    <RechartsTooltip
-                      contentStyle={{ backgroundColor: '#161b22', border: '1px solid #30363d', fontSize: '12px' }}
-                      itemStyle={{ color: '#58a6ff' }}
-                    />
-                    <Area type="monotone" dataKey="profit" stroke="#58a6ff" fillOpacity={1} fill="url(#colorProfit)" />
-                  </AreaChart>
-                </ResponsiveContainer>
+              <div className="w-full h-40" style={{ height: '160px', minWidth: '0' }}>
+                {isMounted && (
+                  <ResponsiveContainer width="100%" height={160}>
+                    <AreaChart data={equityData}>
+                      <defs>
+                        <linearGradient id="colorProfit" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#58a6ff" stopOpacity={0.3} />
+                          <stop offset="95%" stopColor="#58a6ff" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#21262d" vertical={false} />
+                      <XAxis dataKey="time" hide />
+                      <YAxis hide domain={['auto', 'auto']} />
+                      <RechartsTooltip
+                        contentStyle={{ backgroundColor: '#161b22', border: '1px solid #30363d', fontSize: '12px' }}
+                        itemStyle={{ color: '#58a6ff' }}
+                      />
+                      <Area type="monotone" dataKey="profit" stroke="#58a6ff" fillOpacity={1} fill="url(#colorProfit)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                )}
               </div>
             </div>
 
@@ -299,7 +353,7 @@ const App = () => {
                 </div>
                 <div className="space-y-1 text-right">
                   <span className="text-[10px] text-github-text/40 uppercase">AI Signal</span>
-                  <div className={`text-xl font-bold ${signal === 'BUY' ? 'text-github-success' : signal === 'SELL' ? 'text-github-danger' : 'text-github-text'}`}>
+                  <div className={`text-xl font-bold ${signal === 'BUY' ? 'text-github-success' : signal === 'SELL' ? 'text-github-danger' : signal === 'HOLD' ? 'text-github-text/60' : 'text-github-text'}`}>
                     {signal}
                   </div>
                 </div>

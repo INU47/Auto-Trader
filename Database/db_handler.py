@@ -71,6 +71,16 @@ class DBHandler:
         except Exception as e:
             logger.error(f"Failed to initialize schema: {e}")
 
+    def _to_datetime(self, timestamp):
+        """Converts timestamp (seconds or milliseconds) to datetime."""
+        if not timestamp: return datetime.now()
+        if isinstance(timestamp, (int, float)):
+            # If > 1e11, it's likely milliseconds (e.g., 1700...000)
+            if timestamp > 100000000000:
+                return datetime.fromtimestamp(timestamp / 1000.0)
+            return datetime.fromtimestamp(timestamp)
+        return timestamp
+
     async def log_candle(self, symbol, timeframe, candle_data):
         if not self.pool: return
         try:
@@ -79,12 +89,7 @@ class DBHandler:
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (time, symbol, timeframe) DO NOTHING
             """
-            # Convert time from ms integer if needed, or assume datetime object if pre-processed
-            # In native polling, candle['time'] is int (msc). Convert to datetime.
-            if isinstance(candle_data['time'], (int, float)):
-                ts = datetime.fromtimestamp(candle_data['time']/1000.0)
-            else:
-                ts = candle_data['time']
+            ts = self._to_datetime(candle_data['time'])
 
             async with self.pool.acquire() as conn:
                 await conn.execute(query, 
@@ -114,11 +119,7 @@ class DBHandler:
             
             data_tuples = []
             for c in candles_list:
-                # Convert time
-                if isinstance(c['time'], (int, float)):
-                    ts = datetime.fromtimestamp(c['time']/1000.0)
-                else:
-                    ts = c['time']
+                ts = self._to_datetime(c['time'])
                 
                 data_tuples.append((
                     ts,
@@ -136,6 +137,37 @@ class DBHandler:
             logger.info(f"Batch logged {len(data_tuples)} candles.")
         except Exception as e:
             logger.error(f"Failed to log candle batch: {e}")
+
+    async def get_candles(self, symbol, timeframe, days=7):
+        """
+        Fetches historical candles from the database.
+        """
+        if not self.pool: return []
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT time, open, high, low, close, volume as tick_volume
+                    FROM market_candles
+                    WHERE symbol = $1 AND timeframe = $2 AND time > NOW() - (INTERVAL '1 day' * $3)
+                    ORDER BY time ASC
+                """, symbol, timeframe, days)
+                
+                candles = []
+                for r in rows:
+                    candles.append({
+                        'symbol': symbol,
+                        'timeframe': timeframe,
+                        'time': int(r['time'].timestamp()), # Seconds for dashboard/backtest
+                        'open': float(r['open']),
+                        'high': float(r['high']),
+                        'low': float(r['low']),
+                        'close': float(r['close']),
+                        'tick_volume': int(r['tick_volume'])
+                    })
+                return candles
+        except Exception as e:
+            logger.error(f"Failed to fetch candles from DB: {e}")
+            return []
 
     async def log_trade_entry(self, user_id, symbol, action, lot_size, price, signal_data, ticket=0):
         """
@@ -363,7 +395,7 @@ class DBHandler:
             async with self.pool.acquire() as conn:
                 # Find trades where status='CLOSED' and no entry in llm_training_logs
                 query = """
-                    SELECT id, symbol, action, open_price, close_price, pattern_type, cnn_confidence, open_time, net_profit 
+                    SELECT id, symbol, action, open_price, close_price, pattern_type, cnn_confidence, lstm_confidence, open_time, close_time, net_profit 
                     FROM trade_logs t
                     WHERE status = 'CLOSED' 
                       AND NOT EXISTS (SELECT 1 FROM llm_training_logs l WHERE l.trade_id = t.id)
@@ -372,6 +404,12 @@ class DBHandler:
                 trades = await conn.fetch(query, limit)
                 
                 for t in trades:
+                    # Calculate duration in minutes
+                    duration_min = 0
+                    if t['open_time'] and t['close_time']:
+                        diff = t['close_time'] - t['open_time']
+                        duration_min = round(diff.total_seconds() / 60.0, 1)
+
                     # Reconstruct state for the advisor
                     candles = await conn.fetch("""
                         SELECT open, high, low, close, volume as tick_volume
@@ -385,12 +423,16 @@ class DBHandler:
                         unrated.append({
                             'id': t['id'],
                             'symbol': t['symbol'],
-                            'action': 1 if t['action'] == 'BUY' else 2,
+                            'action': t['action'], # Pass original string (BUY/SELL)
                             'reward': float(t['net_profit'] or 0.0),
                             'open_price': float(t['open_price'] or 0.0),
                             'close_price': float(t['close_price'] or 0.0),
+                            'open_time': t['open_time'].strftime('%Y-%m-%d %H:%M:%S') if t['open_time'] else "N/A",
+                            'close_time': t['close_time'].strftime('%Y-%m-%d %H:%M:%S') if t['close_time'] else "N/A",
+                            'duration_minutes': duration_min,
                             'pattern_name': t['pattern_type'],
                             'cnn_confidence': float(t['cnn_confidence'] or 0.0),
+                            'lstm_confidence': float(t['lstm_confidence'] or 0.0),
                             'net_profit': float(t['net_profit'] or 0.0),
                             'state': state_candles
                         })

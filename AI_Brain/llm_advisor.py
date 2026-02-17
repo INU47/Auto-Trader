@@ -2,6 +2,7 @@ from google import genai
 import logging
 import json
 import re
+import asyncio
 
 logger = logging.getLogger("LLMRewardAdvisor")
 
@@ -178,33 +179,36 @@ class LLMRewardAdvisor:
 
     async def _get_llm_score(self, trade_data, model_name):
         prompt = f"""
-        คุณคือผู้เชี่ยวชาญด้านการวิเคราะห์การเทรดอัลกอริทึม (AI Quant Mentor)
-        หน้าที่ของคุณคือประเมินคุณภาพของออเดอร์ที่พึ่งปิดไป เพื่อนำผลประเมินไปสอน (Reinforce) โมเดล AI ของเรา
+        You are an AI Trading Mentor expert in algorithmic trading analysis.
+        Your task is to evaluate the quality of a recently closed trade order to provide reinforcement for our AI models.
         
-        ข้อมูลออเดอร์:
+        Trade Data:
         - Symbol: {trade_data.get('symbol')}
         - Action: {trade_data.get('action')}
+        - Open Time: {trade_data.get('open_time')}
+        - Close Time: {trade_data.get('close_time')}
         - CNN Pattern Confidence: {trade_data.get('cnn_confidence', 0.5):.2f}
-        - LSTM Trend Confidence: {trade_data.get('lstm_confidence', 0.5):.2f}
+        - LSTM Trend Confidence: {trade_data.get('lstm_confidence', trade_data.get('lstm_trend_pred', 0.5)):.2f}
         - Net Profit: ${trade_data.get('net_profit', 0):.2f}
         - Duration: {trade_data.get('duration_minutes', 0)} mins
         
-        กฎการให้คะแนน (Score 0-100):
-        1. ให้คะแนนสูง (70-100) หากออเดอร์กำไรและมี Confidence สูง หรือขาดทุนน้อยแต่ AI ทำตามเทรนด์ได้ดี
-        2. ให้คะแนนต่ำ (0-30) หากขาดทุนหนักจากการเข้าออเดอร์ที่สวนเทรนด์หลัก หรือ AI มีความมั่นใจผิดพลาด (Overconfidence)
-        3. 50 คะแนนคือระดับมาตรฐาน (Neutral)
+        Scoring Rules (Score 0-100):
+        1. High Score (70-100): Profitable trades with high confidence, or small losses where AI followed the trend correctly.
+        2. Low Score (0-30): Large losses from counter-trend entries, or cases of extreme overconfidence.
+        3. 50 Score: Standard/Neutral quality.
         
-        คุณต้องตอบกลับในรูปแบบ JSON วัตถุเดียวเท่านั้น โดยมีโครงสร้างดังนี้:
+        You MUST respond in valid JSON format only, with this structure:
         {{
-            "score": <ตัวเลข 0-100>,
-            "reasoning": "<คำอธิบายสรุปสั้นๆ เป็นภาษาไทย 1-2 ประโยค>"
+            "score": <number 0-100>,
+            "reasoning": "<short summary explanation in English, 1-2 sentences>"
         }}
         
-        ข้อสำคัญ: ห้ามมีข้อความอื่นนอกเหนือจาก JSON ห้ามใส่ ```json หรือคำพูดเกริ่นนำใดๆ ทั้งสิ้น ตอบเฉพาะ JSON เท่านั้น
+        IMPORTANT: Do NOT include any other text except for the JSON. No ```json blocks or introductory text. Respond ONLY with JSON.
         """
         
         try:
-            response = self.client.models.generate_content(
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
                 model=model_name,
                 contents=prompt
             )
@@ -223,7 +227,7 @@ class LLMRewardAdvisor:
             try:
                 result = json.loads(clean_text)
                 score = int(result.get('score', 50))
-                reason = result.get('reasoning', "ไม่มีคำอธิบาย")
+                reason = result.get('reasoning', "No description")
                 return score, reason
             except json.JSONDecodeError:
                 # If direct parse fails, try to find score/reasoning with regex as last resort
@@ -231,7 +235,7 @@ class LLMRewardAdvisor:
                 reason_match = re.search(r'"reasoning":\s*"(.*?)"', text)
                 
                 score = int(score_match.group(1)) if score_match else 50
-                reason = reason_match.group(1) if reason_match else "แกะข้อมูลจาก LLM ล้มเหลว (Fallback)"
+                reason = reason_match.group(1) if reason_match else "LLM parsing failed (Fallback)"
                 
                 if score_match or reason_match:
                     return score, reason
@@ -263,6 +267,6 @@ class LLMRewardAdvisor:
             
         # Clamp between 0-100
         score = max(0, min(100, score))
-        return int(score), "คำนวณโดยระบบสำรอง (Rule-based) เนื่องจาก LLM ไม่พร้อมใช้งาน"
+        return int(score), "Calculated by fallback system (Rule-based) as LLM is unavailable"
 
 

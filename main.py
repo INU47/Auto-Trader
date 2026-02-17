@@ -24,9 +24,33 @@ root_logger.setLevel(logging.INFO)
 if root_logger.hasHandlers():
     root_logger.handlers.clear()
 
+log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+formatter = logging.Formatter(log_format)
+
+# 1. Main System Log
 file_handler = logging.FileHandler("quant_system.log", mode='a', encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
+
+# 2. Error Log (System-wide ERROR and CRITICAL)
+err_handler = logging.FileHandler("errors.log", mode='a', encoding='utf-8')
+err_handler.setFormatter(formatter)
+err_handler.setLevel(logging.ERROR)
+root_logger.addHandler(err_handler)
+
+# 3. All Trades (Signals + Execution Attempts)
+trade_all_handler = logging.FileHandler("trades_all.log", mode='a', encoding='utf-8')
+trade_all_handler.setFormatter(formatter)
+trade_logger = logging.getLogger("Trade")
+trade_logger.setLevel(logging.INFO)
+trade_logger.addHandler(trade_all_handler)
+
+# 4. Executed Trades Only
+trade_exe_handler = logging.FileHandler("trades_executed.log", mode='a', encoding='utf-8')
+trade_exe_handler.setFormatter(formatter)
+trade_exe_logger = logging.getLogger("Trade.Executed")
+trade_exe_logger.setLevel(logging.INFO)
+trade_exe_logger.addHandler(trade_exe_handler)
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -173,12 +197,24 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             msg = f"❌ **Order Failed**: {result.comment if result else 'None'} (Code: {result.retcode if result else 'N/A'})"
             logger.error(msg)
+            trade_logger.error(f"{symbol} execution failed: {result.comment if result else 'None'}")
             if notifier: await notifier.send_message(msg)
             return None
         else:
             reason = signal_data.get('reason', 'N/A') if signal_data else 'Manual/Unknown'
-            msg = f"✅ **Order Executed**\n\n🎯 {action} {volume} {symbol} @ {result.price}\n📝 Reason: {reason}"
+            # Enhanced Notification
+            msg = (
+                f"✅ **Order Executed**\n\n"
+                f"🎫 **Ticket**: {result.order}\n"
+                f"🎯 **Action**: {action}\n"
+                f"📦 **Volume**: {volume}\n"
+                f"💰 **Price**: {result.price}\n"
+                f"🛑 **SL**: {sl}\n"
+                f"🏁 **TP**: {tp}\n"
+                f"📝 **Reason**: {reason}"
+            )
             logger.info(msg)
+            trade_exe_logger.info(f"ORDER_{result.order}: {action} {volume} {symbol} @ {result.price} | SL: {sl} | TP: {tp} | Reason: {reason}")
             if notifier: await notifier.send_message(msg)
         
         # 4. Log Trade Entry for RL
@@ -250,8 +286,18 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
             deals = mt5.history_deals_get(position=p.ticket)
             total_profit = sum([d.profit + d.swap + d.commission for d in deals]) if deals else 0.0
             
-            msg = f"🎯 **Position Closed**\n\n📌 {symbol}\n🎫 Ticket: {p.ticket}\n💰 P/L: ${total_profit:.2f}"
+            # Standardized Notification
+            msg = (
+                f"🎯 **Position Closed**\n\n"
+                f"🎫 **Ticket**: {p.ticket}\n"
+                f"📌 **Symbol**: {symbol}\n"
+                f"📦 **Volume**: {p.volume}\n"
+                f"💰 **P/L**: ${total_profit:.2f}\n"
+                f"🚪 **Exit Price**: {res.price}\n"
+                f"📝 **Reason**: { 'REVERSAL' if action_type is not None else 'MANUAL' }"
+            )
             logger.info(msg + f" (User: {user_id})")
+            trade_exe_logger.info(f"CLOSE_{'REVERSAL' if action_type is not None else 'MANUAL'}: {symbol} | Ticket: {p.ticket} | Vol: {p.volume} | P/L: ${total_profit:.2f} (User: {user_id})")
             if notifier: await notifier.send_message(msg)
             
             if db:
@@ -260,77 +306,56 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
             logger.error(f"Failed to close {p.ticket} for User {user_id}: {res.comment}")
 
 async def sync_historical_data(managers_dict, db):
-    """Fetches history for all configured symbols and timeframes (Last 2 Weeks)."""
-    # Phase 90: Targeted 2-Week Sync (14 days)
-    # M1: 20160, M5: 4032, H1: 336
-    WEEKS = 2
-    DAYS = WEEKS * 7
-    
-    logger.info(f"🔄 Deep Sync: Fetching last {WEEKS} weeks of data from MT5...")
-    m1_history_batch = []
+    """Fetches history from Local DB (Optimized for speed). Fallback to MT5 if empty."""
+    DAYS = 7
+    logger.info(f"🔄 Syncing History: Fetching last {DAYS} days of data from Database...")
+    history_batch = []
     
     config_path = "Config/mt5_config.json"
     if not os.path.exists(config_path): return []
-
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    if not mt5.terminal_info():
-        logger.info("Initializing MT5 for sync...")
-        if not mt5.initialize(login=config['login'], server=config['server'], password=config['password']):
-            logger.error(f"MT5 initialization failed: {mt5.last_error()}. Sync skipped.")
-            return []
-
-    tf_map = {60: mt5.TIMEFRAME_M1, 300: mt5.TIMEFRAME_M5, 3600: mt5.TIMEFRAME_H1}
+    with open(config_path, "r") as f: config = json.load(f)
     symbols = config.get('symbols', ["EURUSD"])
     
     for symbol in symbols:
         if symbol not in managers_dict:
             managers_dict[symbol] = MTFManager(timeframes=[60, 300, 3600], window_size=32)
             
-        logger.info(f"Syncing {symbol}...")
-        for tf_sec, mt5_tf in tf_map.items():
-            # Calculate count for 14 days
-            if tf_sec == 60: count = DAYS * 24 * 60
-            elif tf_sec == 300: count = DAYS * 24 * 12
-            else: count = DAYS * 24
+        for tf_sec, tf_label in {60: 'M1', 300: 'M5', 3600: 'H1'}.items():
+            # 1. Try DB first
+            candles = await db.get_candles(symbol, tf_label, days=DAYS)
             
-            logger.info(f"  > Fetching {count} candles for TF={tf_sec}s...")
-            rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
-            if rates is not None:
-                tf_label = {60: 'M1', 300: 'M5', 3600: 'H1'}.get(tf_sec, 'M1')
-                db_batch = []
+            # 2. Fallback to MT5 if DB is empty for this symbol/TF (initial run)
+            if not candles:
+                logger.info(f"  [!] DB Empty for {symbol} {tf_label}. Quick backfill from MT5...")
+                if not mt5.terminal_info():
+                    mt5.initialize(login=config['login'], server=config['server'], password=config['password'])
                 
-                for i, rate in enumerate(rates):
-                    candle = {
-                        'symbol': symbol, 'timeframe': tf_label,
-                        'open': float(rate['open']), 'high': float(rate['high']), 
-                        'low': float(rate['low']), 'close': float(rate['close']), 
-                        'tick_volume': int(rate['tick_volume']), 'time': int(rate['time'])
-                    }
-                    
-                    # Add to memory buffer (only last 500 for computation)
-                    if len(rates) - i <= 500:
-                         managers_dict[symbol].buffers[tf_sec].add_candle(candle)
-                    
-                    db_batch.append(candle)
-
-                    # Prepare for Dashboard (only M1 for chart)
-                    if tf_sec == 60:
-                        m1_history_batch.append({
-                            "type": "candle", "symbol": symbol, "timeframe": tf_label,
-                            "time": int(rate['time']), "open": candle['open'],
-                            "high": candle['high'], "low": candle['low'], "close": candle['close']
+                mt5_tf = {60: mt5.TIMEFRAME_M1, 300: mt5.TIMEFRAME_M5, 3600: mt5.TIMEFRAME_H1}.get(tf_sec)
+                # Fetch 2 days from MT5 as a quick backfill if DB is empty
+                count = (2 * 24 * 60) if tf_sec == 60 else (2 * 24 * 12) if tf_sec == 300 else (2 * 24)
+                rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+                if rates is not None:
+                    mt5_candles = []
+                    for rate in rates:
+                        mt5_candles.append({
+                            'symbol': symbol, 'timeframe': tf_label,
+                            'open': float(rate['open']), 'high': float(rate['high']), 
+                            'low': float(rate['low']), 'close': float(rate['close']), 
+                            'tick_volume': int(rate['tick_volume']), 'time': int(rate['time'])
                         })
-                
-                logger.info(f"  > Synced {len(db_batch)} candles to DB for {tf_label}")
+                    await db.log_candles_batch(mt5_candles)
+                    candles = await db.get_candles(symbol, tf_label, days=DAYS)
 
-                # Log Batch to DB
-                if db:
-                    await db.log_candles_batch(db_batch)
-    
-    logger.info(f"Sync complete. Total items prepared: {len(m1_history_batch)}")
-    return m1_history_batch
+            # 3. Populate Buffers & Dashboard Batch
+            for i, candle in enumerate(candles):
+                if len(candles) - i <= 500:
+                    managers_dict[symbol].buffers[tf_sec].add_candle(candle)
+                
+                history_batch.append({"type": "candle", **candle})
+            
+            logger.info(f"  > Synced {len(candles)} candles for {symbol} {tf_label}")
+
+    return history_batch
 
 async def run_trading_engine():
     """Main Orchestrator for Multi-User Trading System."""
@@ -371,6 +396,7 @@ async def run_trading_engine():
             try:
                 cmds = await notifier.check_commands()
                 for cmd in cmds:
+                    logger.info(f"📩 Telegram Command received: {cmd}")
                     if cmd == "/info":
                         # Comprehensive System Information
                         users = await db.get_active_users()
@@ -388,7 +414,7 @@ async def run_trading_engine():
                         
                         msg = f"""📊 **SYSTEM INFO**
 
-🔧 **Status**: ACTIVE
+🔧 **Status**: {'ACTIVE' if state.get("trading_enabled", True) else 'PAUSED'}
 👥 **Users**: {len(users)} active
 ⚙️ **Workers**: {len(active_workers)} running
 
@@ -405,6 +431,29 @@ async def run_trading_engine():
 💾 **Database**: {'🟢 CONNECTED' if await db.is_healthy() else '🔴 DISCONNECTED'}"""
                         
                         await notifier.send_message(msg)
+                    
+                    elif cmd == "/on":
+                        state["trading_enabled"] = True
+                        await notifier.send_message("✅ **Trading Enabled**: The system is now active and monitoring for signals.")
+                        logger.info("System ENABLED via Telegram.")
+                        
+                    elif cmd == "/off":
+                        state["trading_enabled"] = False
+                        await notifier.send_message("🛑 **Trading Disabled**: New trade execution is now paused.")
+                        logger.info("System DISABLED via Telegram.")
+                        
+                    elif cmd == "/history":
+                        # Show last 5 trades
+                        trades = await db.get_rl_training_data(limit=5)
+                        if not trades:
+                            await notifier.send_message("📊 **History**: No recent trades found in database.")
+                        else:
+                            history_msg = "📊 **Recent History**\n\n"
+                            for t in trades:
+                                icon = "🟢" if t['reward'] > 0 else "🔴"
+                                history_msg += f"{icon} {t['symbol']} | {t['action']} | PnL: ${t['reward']:.2f}\n"
+                            await notifier.send_message(history_msg)
+
             except Exception as e: logger.error(f"Command worker error: {e}")
             await asyncio.sleep(5)
 
@@ -481,7 +530,7 @@ async def run_trading_engine():
                                 await notifier.send_message(f"🧠 **RL Learning Complete**\nModel refined based on real profit/loss data.\n\n```\n{recent_report}\n```")
                         except Exception as e:
                             logger.error(f"Failed to read backtest log: {e}")
-                            await notifier.send_message("🧠 **RL Learning Complete**: บอทเรียนรู้จากผลกำไรขาดทุนล่าสุดเรียบร้อยครับ!")
+                            await notifier.send_message("🧠 **RL Learning Complete**: Bot has successfully refined its model based on recent trade performance.")
             except Exception as e:
                 logger.error(f"⚠️ Retraining Exception: {e}")
 
@@ -600,25 +649,38 @@ async def run_trading_engine():
                                 profit = exit_deal.profit
                                 exit_price = exit_deal.price
                                 exit_time = datetime.datetime.fromtimestamp(exit_deal.time)
-                                exit_reason = "TP/SL/Manual" # Ideally deduce from deal reason
-                                
+                                # Determine Closure Reason
+                                reason_code = exit_deal.reason
+                                closure_reason = "MANUAL"
+                                if reason_code == mt5.DEAL_REASON_TP:
+                                    closure_reason = "TAKE PROFIT"
+                                elif reason_code == mt5.DEAL_REASON_SL:
+                                    closure_reason = "STOP LOSS"
+                                elif reason_code == mt5.DEAL_REASON_EXPERT:
+                                    closure_reason = "EXPERT/BOT"
+
                                 await db.log_trade_exit_by_ticket(
                                     user_id, 
                                     ticket, 
                                     exit_price, 
                                     profit, 
                                     profit, # net profit roughly same for now
-                                    reason=exit_reason
+                                    reason=closure_reason
                                 )
-                                logger.info(f"✅ Synced exit for Ticket {ticket}: Profit {profit}, Price {exit_price}")
+                                logger.info(f"✅ Synced exit for Ticket {ticket}: Profit {profit}, Price {exit_price}, Reason {closure_reason}")
                                 
-                                # Send Notification
-                                await notifier.send_message(
-                                    f"💰 <b>Trade Closed ({username})</b>\n"
-                                    f"Symbol: {db_pos['symbol']}\n"
-                                    f"Profit: ${profit:.2f}\n"
-                                    f"Price: {exit_price}"
+                                # Send Standardized Notification
+                                msg = (
+                                    f"🎯 **Position Closed ({username})**\n\n"
+                                    f"🎫 **Ticket**: {ticket}\n"
+                                    f"📌 **Symbol**: {db_pos['symbol']}\n"
+                                    f"🎯 **Action**: {db_pos['action']}\n"
+                                    f"📦 **Volume**: {db_pos['lot_size']}\n"
+                                    f"💰 **P/L**: ${profit:.2f}\n"
+                                    f"🚪 **Exit Price**: {exit_price}\n"
+                                    f"📝 **Reason**: {closure_reason}"
                                 )
+                                await notifier.send_message(msg)
                                 
                                 # Reset retry count on success
                                 if ticket in retry_counts: del retry_counts[ticket]
@@ -659,15 +721,18 @@ async def run_trading_engine():
                     mgr = mtf_managers[symbol]
                     closed_tfs = mgr.add_tick({'symbol': symbol, 'bid': tick.bid, 'time': int(tick.time_msc)})
                     
-                    # Update Dashboard
-                    current_m1 = mgr.aggregators[60].get_current_candle()
-                    if current_m1:
-                        await post_to_dashboard({"type": "candle", "symbol": symbol, **current_m1})
+                    # Update Dashboard (M1, M5, H1 current candles)
+                    for tf_sec, label in {60: 'M1', 300: 'M5', 3600: 'H1'}.items():
+                        current_c = mgr.aggregators[tf_sec].get_current_candle()
+                        if current_c:
+                            await post_to_dashboard({"type": "candle", "symbol": symbol, "timeframe": label, **current_c})
 
-                    if 60 in closed_tfs:
-                        m1 = mgr.aggregators[60].get_last_closed_candle()
-                        if m1:
-                            await db.log_candle(symbol, "M1", m1)
+                    for tf_sec in closed_tfs:
+                        label = {60: 'M1', 300: 'M5', 3600: 'H1'}.get(tf_sec)
+                        if label:
+                            c = mgr.aggregators[tf_sec].get_last_closed_candle()
+                            if c:
+                                await db.log_candle(symbol, label, c)
                 await asyncio.sleep(0.1)
             except Exception as e: logger.error(f"Poller error: {e}"); await asyncio.sleep(1)
 
@@ -700,6 +765,11 @@ async def run_trading_engine():
         
         try:
             while True:
+                # Check for global trading pause
+                if not state.get("trading_enabled", True):
+                    await asyncio.sleep(5)
+                    continue
+                    
                 # Check DB for kill signal
                 # (This would be more complex in production, here we just loop)
                 
@@ -736,13 +806,17 @@ async def run_trading_engine():
                     
                     if signal['action'] != 'HOLD':
                         # 3. Execution (User-Specific)
+                        trade_logger.info(f"SIGNAL: {username} | {symbol} {signal['action']} (Confidence: {signal['confidence']:.2f})")
                         logger.info(f"🚀 Worker {username}: Signal {symbol} {signal['action']}")
                         
                         account = mt5.account_info()
                         current_equity = account.equity if account else 1000.0
                         
                         # Reversal Logic
-                        reversal_threshold = srv_config.get("reversal_confidence_threshold", 0.75)
+                        current_mode = worker_state.get("ai_mode", "EXPLORER")
+                        default_threshold = 0.60 if current_mode == "EXPLORER" else 0.65
+                        reversal_threshold = srv_config.get("reversal_confidence_threshold", default_threshold)
+                        
                         if signal['confidence'] >= reversal_threshold:
                             target_to_close = mt5.POSITION_TYPE_SELL if signal['action'] == 'BUY' else mt5.POSITION_TYPE_BUY
                             await close_all_positions(user_id, symbol, action_type=target_to_close, notifier=notifier, db=db)
@@ -779,6 +853,7 @@ async def run_trading_engine():
                         # 3. Final Lot Size (Risk-based capped by Affordable)
                         lot_size = min(risk_lots, affordable_lots)
                         
+                        trade_logger.info(f"LOTS: {username} | {symbol} | Risk: {risk_lots}, FreeMargin: {free_margin}, Affordable: {affordable_lots} -> Final: {lot_size}")
                         logger.info(f"💰 Lot Calculation for {username} ({symbol}): Risk={risk_lots}, Affordable={affordable_lots} -> Final={lot_size}")
                         
                         if lot_size < symbol_info.volume_min:
@@ -803,15 +878,14 @@ async def run_trading_engine():
     logger.info("🔄 Syncing historical data from MT5...")
     m1_history = await sync_historical_data(mtf_managers, db)
     
-    # 2. Push to Dashboard
+    # 2. Push to Dashboard in a SINGLE BATCH
     if m1_history:
-        logger.info(f"📤 Pushing {len(m1_history)} M1 candles to Dashboard...")
-        for candle in m1_history:
-            await post_to_dashboard(candle)
+        logger.info(f"📤 Pushing {len(m1_history)} historical candles to Dashboard (Batch)...")
+        await post_to_dashboard(m1_history)
     
     # Send Startup Notification to Telegram
     await notifier.send_message(
-        "🚀 **QuantSystem Started**\n\nโหมดการทำงาน: {}\nผู้ดูแลระบบพร้อมช่วยเหลือครับ!".format(srv_config.get("ai_mode", "EXPLORER")),
+        "🚀 **QuantSystem Started**\n\nOperation Mode: {}\nSystem is ready and monitoring.".format(srv_config.get("ai_mode", "EXPLORER")),
         reply_markup=notifier.get_main_menu()
     )
     

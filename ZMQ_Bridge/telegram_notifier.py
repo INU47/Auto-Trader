@@ -84,7 +84,7 @@ class TelegramNotifier:
                             text = message.get("text", "")
                             from_id = str(message.get("from", {}).get("id", ""))
                             
-                            if from_id == self.chat_id and text:
+                            if from_id == str(self.chat_id) and text:
                                 new_cmds.append(text.lower().strip())
                         return new_cmds
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError):
