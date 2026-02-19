@@ -1,3 +1,5 @@
+performance_log.txt
+reset_system.py
 Config/*.json
 AI_Brain/weights/*.pt
 AI_Brain/weights/*/

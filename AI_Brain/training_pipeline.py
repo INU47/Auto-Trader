@@ -403,11 +403,16 @@ def train_and_backtest():
     optimizer_cnn = optim.Adam(cnn.parameters(), lr=LR)
     optimizer_lstm = optim.Adam(lstm.parameters(), lr=LR)
     
+    # 3.1. Schedulers (Phase 95)
+    scheduler_cnn = optim.lr_scheduler.ReduceLROnPlateau(optimizer_cnn, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler_lstm = optim.lr_scheduler.ReduceLROnPlateau(optimizer_lstm, mode='min', factor=0.5, patience=5, verbose=True)
+    
     # Simple Train Loop
-    best_loss = float('inf')
+    best_val_loss = float('inf')
     for epoch in range(EPOCHS):
+        # --- Training Phase ---
         cnn.train(); lstm.train()
-        total_loss = 0
+        train_loss = 0
         for gaf, seq, l_cls, l_reg in train_loader:
             gaf, seq = gaf.to(device), seq.to(device)
             l_cls, l_reg = l_cls.to(device), l_reg.to(device)
@@ -418,18 +423,38 @@ def train_and_backtest():
             loss.backward()
             
             optimizer_cnn.step(); optimizer_lstm.step()
-            total_loss += loss.item()
+            train_loss += loss.item()
         
-        avg_loss = total_loss / len(train_loader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # --- Validation Phase (Phase 95) ---
+        cnn.eval(); lstm.eval()
+        val_loss = 0
+        # Re-using val_dataset with a loader for batch processing
+        val_loader_internal = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        with torch.no_grad():
+            for gaf, seq, l_cls, l_reg in val_loader_internal:
+                gaf, seq = gaf.to(device), seq.to(device)
+                l_cls, l_reg = l_cls.to(device), l_reg.to(device)
+                
+                loss = criterion_cls(cnn(gaf), l_cls) + criterion_reg(lstm(seq).squeeze(), l_reg)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader_internal)
+        
+        # Update Schedulers
+        scheduler_cnn.step(avg_val_loss)
+        scheduler_lstm.step(avg_val_loss)
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             if not os.path.exists("AI_Brain/weights"): os.makedirs("AI_Brain/weights")
             torch.save(cnn.state_dict(), "AI_Brain/weights/best_cnn_model.pt")
             torch.save(lstm.state_dict(), "AI_Brain/weights/best_lstm_model.pt")
-            logger.info(f"New best model saved at Epoch {epoch+1} with Loss: {best_loss:.4f}")
+            logger.info(f"New BEST model saved (Epoch {epoch+1}) | Val Loss: {avg_val_loss:.4f} | Train Loss: {avg_train_loss:.4f}")
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info(f"Epoch {epoch+1}: Loss {avg_loss:.4f}")
+            logger.info(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | LR: {optimizer_cnn.param_groups[0]['lr']:.6f}")
         
     # Finalize: Load best weights and save as production weights
     try:
@@ -488,8 +513,15 @@ class RLExperienceDataset(Dataset):
         
     def __getitem__(self, idx):
         exp = self.experiences[idx]
-        # state is list of 32 candles
-        df_state = pd.DataFrame(exp['state'])
+        
+        # Phase 95: Handle MTF state (Defaulting to M1 for backward model compatibility)
+        # In the future, we could concatenate all timeframes here.
+        m1_data = exp['state'].get('M1')
+        if not m1_data:
+            # Fallback if M1 is missing (shouldn't happen with updated DB handler)
+            m1_data = list(exp['state'].values())[0] if exp['state'] else [{}]*self.window_size
+            
+        df_state = pd.DataFrame(m1_data)
         
         # GAF Image
         gaf_img = self.gaf_transformer.transform(df_state['close'].values)
@@ -545,29 +577,49 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=50, lr=0.0001
     optimizer_cnn = optim.Adam(cnn.parameters(), lr=lr)
     optimizer_lstm = optim.Adam(lstm.parameters(), lr=lr)
     
+    # 2. LR Scheduler (Phase 95)
+    scheduler_cnn = optim.lr_scheduler.ReduceLROnPlateau(optimizer_cnn, mode='max', factor=0.5, patience=5, verbose=True)
+    scheduler_lstm = optim.lr_scheduler.ReduceLROnPlateau(optimizer_lstm, mode='max', factor=0.5, patience=5, verbose=True)
+    
     cnn.train(); lstm.train()
     
-    best_loss = float('inf')
+    best_policy_score = -float('inf') 
+    
     for epoch in range(epochs):
         epoch_loss = 0
+        epoch_score = 0 # Policy Score (Expected Reward)
+        
         for gaf, seq, action, reward in loader:
+            gaf, seq = gaf.to(device), seq.to(device)
+            action, reward = action.to(device), reward.to(device)
+            
             optimizer_cnn.zero_grad()
             optimizer_lstm.zero_grad()
             
             # 1. Forward Pass
             logits = cnn(gaf)
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1) # [B, 3] usually
             
-            # 2. Select prob of the action taken
-            # action is 1 (BUY) or 2 (SELL)
+            # 2. Reward Standardization (Z-Score) (Phase 95)
+            # This stabilizes gradients by making rewards relative within the batch
+            if len(reward) > 1:
+                std = reward.std()
+                norm_reward = (reward - reward.mean()) / (std + 1e-8)
+            else:
+                norm_reward = reward / 10.0 # Fallback for single samples
+            
+            # 3. Policy Gradient Loss
             m = torch.distributions.Categorical(probs)
             log_prob = m.log_prob(action)
-            
-            # 3. Policy Gradient Loss (Maximizing expected reward)
-            # Standard: minimize -log_prob * reward
-            # Scale reward to be more stable (e.g. normalize or clamp)
-            norm_reward = reward / 10.0 # Small scale
             loss = - (log_prob * norm_reward).mean()
+            
+            # 4. Calculate Batch Policy Score (Phase 95)
+            # This is the 'Expected Reward' based on current probabilities
+            # it tells us how much the model 'values' the profitable actions
+            with torch.no_grad():
+                # probabilities of the actions taken * actual reward
+                batch_score = (probs.gather(1, action.unsqueeze(1)).squeeze() * reward).mean()
+                epoch_score += batch_score.item()
             
             loss.backward()
             optimizer_cnn.step()
@@ -576,15 +628,22 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=50, lr=0.0001
             epoch_loss += loss.item()
             
         avg_loss = epoch_loss / len(loader)
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        avg_score = epoch_score / len(loader)
+        
+        # Step Schedulers based on Score (Higher score = Better performance)
+        scheduler_cnn.step(avg_score)
+        scheduler_lstm.step(avg_score)
+
+        # 5. Saving based on Policy Score instead of Loss
+        if avg_score > best_policy_score:
+            best_policy_score = avg_score
             if not os.path.exists("AI_Brain/weights"): os.makedirs("AI_Brain/weights")
             torch.save(cnn.state_dict(), "AI_Brain/weights/best_cnn_model.pt")
             torch.save(lstm.state_dict(), "AI_Brain/weights/best_lstm_model.pt")
-            logger.info(f"New best RL model saved at Epoch {epoch+1} with Loss: {best_loss:.6f}")
+            logger.info(f"New BEST RL model saved (Epoch {epoch+1}) | Score: {avg_score:.6f} | Loss: {avg_loss:.6f}")
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            logger.info(f"RL Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.6f}")
+            logger.info(f"RL Epoch {epoch+1}/{epochs} | Score: {avg_score:.6f} | Loss: {avg_loss:.6f} | LR: {optimizer_cnn.param_groups[0]['lr']:.6f}")
 
     # Finalize: Load best weights and save as production weights
     try:
@@ -592,7 +651,7 @@ async def train_rl_mode(experiences, advisor=None, db=None, epochs=50, lr=0.0001
         lstm.load_state_dict(torch.load("AI_Brain/weights/best_lstm_model.pt"))
         torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")
         torch.save(lstm.state_dict(), "AI_Brain/weights/lstm_model.pt")
-        logger.info(f"RL Training Complete. Best model (Loss: {best_loss:.6f}) promoted to production.")
+        logger.info(f"RL Training Complete. Best model (Score: {best_policy_score:.6f}) promoted to production.")
     except Exception as e:
         logger.error(f"Failed to promote best RL model: {e}")
         torch.save(cnn.state_dict(), "AI_Brain/weights/cnn_model.pt")

@@ -19,9 +19,9 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-        # Send ALL stored history to new client
+        
+        # Send stored history to new client
         if self.history:
-            # Flatten all history into a single list for bulk sending
             all_history = []
             for key, items in self.history.items():
                 all_history.extend(items)
@@ -88,9 +88,7 @@ async def push_data(data: list | dict = Body(...)):
             if len(manager.history[key]) > 1000:
                 manager.history[key] = manager.history[key][-1000:]
         
-        # NOTE: Main engine now handles LLM analysis generation and sends it with the signal.
-        # Server just relays the 'analysis' field if present.
-        
+        # Relay data (signals, candles, etc.) to all clients
         await manager.broadcast(json.dumps(data))
     return {"status": "ok"}
 

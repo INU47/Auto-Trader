@@ -98,84 +98,84 @@ class LLMRewardAdvisor:
 
         # Phase 84: Infinite Retry Loop
         while True:
-            # Check Cooldown (likely cleared by sleep below, but good for safety)
-            if time.time() < self.cooldown_until:
-                 remaining = self.cooldown_until - time.time()
-                 if remaining > 0:
-                     logger.info(f"⏳ Still in cooldown. Waiting {int(remaining)}s...")
-                     await asyncio.sleep(remaining)
+            keys_tried = 0
+            max_keys = len(self.api_key_pool)
+            
+            while keys_tried < max_keys:
+                # Check Cooldown
+                now = time.time()
+                if now < self.cooldown_until:
+                     remaining = self.cooldown_until - now
+                     if remaining > 0:
+                         logger.info(f"⏳ Still in cooldown. Waiting {int(remaining)}s...")
+                         await asyncio.sleep(remaining)
 
-            try:
-                # Try models in the pool sequentially
-                for _ in range(len(self.active_pool)):
-                    if not self.active_pool: break
-                    
-                    model_name = self.active_pool[self.current_model_idx]
-                    try:
-                        score, reason = await self._get_llm_score(trade_data, model_name)
-                        self.consecutive_429s = 0 # Reset on success
-                        return score, reason
-                    except Exception as e:
-                        err_str = str(e)
+                try:
+                    # Try models in the pool sequentially
+                    success = False
+                    for _ in range(len(self.active_pool)):
+                        if not self.active_pool: break
                         
-                        # Handle Zero Quota (limit: 0) or Invalid Models (404) - Disqualify model immediately
-                        if "limit: 0" in err_str or "404" in err_str or "NOT_FOUND" in err_str:
-                            logger.error(f"🚫 Model {model_name} is unusable ({err_str[:50]}). Removing from pool.")
-                            self.blacklisted_models.add(model_name)
-                            if model_name in self.active_pool:
-                                self.active_pool.remove(model_name)
-                            if self.active_pool:
-                                self.current_model_idx %= len(self.active_pool)
-                            continue # Try next model in pool immediately
+                        model_name = self.active_pool[self.current_model_idx]
+                        try:
+                            score, reason = await self._get_llm_score(trade_data, model_name)
+                            self.consecutive_429s = 0 # Reset on success
+                            return score, reason
+                        except Exception as e:
+                            err_str = str(e)
                             
-                        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                            # Move to next model in pool for the NEXT attempt in this loop
-                            if self.active_pool:
-                                self.current_model_idx = (self.current_model_idx + 1) % len(self.active_pool)
+                            if "limit: 0" in err_str or "404" in err_str or "NOT_FOUND" in err_str:
+                                logger.error(f"🚫 Model {model_name} unusable ({err_str[:50]}). Blacklisting.")
+                                if model_name in self.active_pool:
+                                    self.active_pool.remove(model_name)
+                                if self.active_pool:
+                                    self.current_model_idx %= len(self.active_pool)
+                                continue 
+                                
+                            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                                if self.active_pool:
+                                    self.current_model_idx = (self.current_model_idx + 1) % len(self.active_pool)
+                                logger.warning(f"LLM Rate Limited ({model_name}). Trying next model...")
+                                await asyncio.sleep(1)
+                                continue 
                             
-                            logger.warning(f"LLM Rate Limited ({model_name}). Trying next model in pool if available...")
-                            await asyncio.sleep(1) # Safety delay to prevent hammering the API
-                            continue # Try NEXT model in the pool IMMEDIATELY
+                            if "401" in err_str or "API_KEY_INVALID" in err_str:
+                                self.is_connected = False 
+                                logger.error(f"Critical API Error: Invalid API Key #{self.current_key_idx + 1}")
+                                break # Break current model loop, try next key
+                            
+                            raise e
+                    
+                    # If model loop finishes without success
+                    keys_tried += 1
+                    if keys_tried < max_keys:
+                        logger.warning(f"⚠️ Key #{self.current_key_idx + 1} exhausted. Rotating...")
+                        self._rotate_key()
+                    else:
+                        break # All keys tried, proceed to long sleep
                         
-                        if "401" in err_str or "API_KEY_INVALID" in err_str:
-                            self.is_connected = False 
-                            logger.error("Critical API Error: Invalid API Key.")
-                            break
-                        
-                        raise e
-                # If the loop finishes without success (All models in THIS key failed)
-                logger.warning("⚠️ All models exhausted for CURRENT API Key.")
-                
-                # Try rotating key
-                if self._rotate_key():
-                    # Recursive retry with new key (limited depth implicit by cooldowns/logic)
-                    continue 
-                else:
-                    # Phase 84: Intelligent Quota Management (Wait & Retry)
-                    self.consecutive_429s += 1
-                    # Use configured retry interval (default 30 mins)
-                    retry_minutes = 30 
-                    wait_time = retry_minutes * 60
-                    
-                    self.cooldown_until = time.time() + wait_time
-                    logger.warning(f"🛑 All Keys & Models exhausted. Waiting {retry_minutes} mins for quota recovery...")
-                    logger.warning(f"⏳ Sleeping until {time.ctime(self.cooldown_until)}...")
-                    
-                    # BLOCKING WAIT (Intentional as per Phase 84)
-                    await asyncio.sleep(wait_time)
-                    
-                    # After waking up, clear blocks and retry
-                    self.cooldown_until = 0
-                    self.consecutive_429s = 0
-                    self.blacklisted_models.clear()
-                    self.active_pool = list(self.model_pool)
-                    logger.info("♻️ Waking up from quota sleep. Retrying LLM analysis...")
-                    continue
+                except Exception as e:
+                    logger.warning(f"Unexpected error with Key #{self.current_key_idx + 1}: {e}")
+                    keys_tried += 1
+                    self._rotate_key()
 
-            except Exception as e:
-                logger.warning(f"LLM Assessment failed with unexpected error: {e}")
-                logger.warning("Retrying in 60 seconds...")
-                await asyncio.sleep(60)
+            # If the loop finishes without success (All keys exhausted)
+            self.consecutive_429s += 1
+            retry_minutes = 30 
+            wait_time = retry_minutes * 60
+            
+            self.cooldown_until = time.ctime(time.time() + wait_time)
+            logger.warning(f"🛑 ALL {max_keys} KEYS EXHAUSTED. Waiting {retry_minutes} mins for quota recovery...")
+            logger.warning(f"⏳ Sleeping until {self.cooldown_until}...")
+            
+            self.cooldown_until = time.time() + wait_time # Store as float for comparison
+            await asyncio.sleep(wait_time)
+            
+            # Reset for next full cycle
+            self.cooldown_until = 0
+            self.consecutive_429s = 0
+            self.active_pool = list(self.model_pool)
+            logger.info("♻️ Waking up from quota sleep. Restarting full rotation cycle...")
 
     async def _get_llm_score(self, trade_data, model_name):
         prompt = f"""

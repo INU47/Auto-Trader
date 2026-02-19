@@ -355,18 +355,24 @@ class DBHandler:
                 """, limit)
                 
                 for t in trades:
-                    # 2. Reconstruct State: Get last 32 candles before open_time
-                    # We pick M1 timeframe for state reconstruction as it's the primary signal source
-                    candles = await conn.fetch("""
-                        SELECT open, high, low, close, volume as tick_volume
-                        FROM market_candles
-                        WHERE symbol = $1 AND timeframe = 'M1' AND time < $2
-                        ORDER BY time DESC LIMIT $3
-                    """, t['symbol'], t['open_time'], window_size)
+                    # 2. Reconstruct State: Get last 32 candles for ALL timeframes (M1, M5, H1)
+                    # This aligns RL training with actual MTF inference
+                    mtf_state = {}
                     
-                    if len(candles) == window_size:
-                        # Reverse list to get chronological order (Oldest to Newest)
-                        state_candles = [dict(c) for c in reversed(candles)]
+                    for tf_label in ['M1', 'M5', 'H1']:
+                        candles = await conn.fetch("""
+                            SELECT open, high, low, close, volume as tick_volume
+                            FROM market_candles
+                            WHERE symbol = $1 AND timeframe = $2 AND time < $3
+                            ORDER BY time DESC LIMIT $4
+                        """, t['symbol'], tf_label, t['open_time'], window_size)
+                        
+                        if len(candles) == window_size:
+                            # Reverse list to get chronological order (Oldest to Newest)
+                            mtf_state[tf_label] = [dict(c) for c in reversed(candles)]
+                    
+                    # Only append if we have all timeframes (to ensure complete state vector)
+                    if len(mtf_state) == 3:
                         experiences.append({
                             'id': t['id'],
                             'symbol': t['symbol'],
@@ -376,7 +382,7 @@ class DBHandler:
                             'close_price': float(t['close_price'] or 0.0),
                             'pattern_name': t['pattern_type'],
                             'cnn_confidence': float(t['cnn_confidence'] or 0.0),
-                            'state': state_candles
+                            'state': mtf_state # Dict of lists
                         })
             
             logger.info(f"Reconstructed {len(experiences)} RL experiences from DB.")

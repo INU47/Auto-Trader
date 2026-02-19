@@ -1,4 +1,5 @@
 import asyncio
+import time
 import httpx
 import logging
 import json
@@ -301,9 +302,69 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
             if notifier: await notifier.send_message(msg)
             
             if db:
-                await db.log_trade_exit_by_ticket(user_id, p.ticket, res.price, res.profit, total_profit, reason="REVERSAL" if action_type is not None else "MANUAL")
+                await db.log_trade_exit_by_ticket(user_id, p.ticket, res.price, total_profit, total_profit, reason="REVERSAL" if action_type is not None else "MANUAL")
         else:
             logger.error(f"Failed to close {p.ticket} for User {user_id}: {res.comment}")
+
+async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10):
+    """Phase 93A: Trailing Stop Management.
+    
+    When a position's profit reaches `activation_pips`, the SL is moved
+    to trail the current price by `trailing_pips`. SL only moves in the
+    profitable direction — never against the trade.
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return
+    
+    symbol_info = mt5.symbol_info(symbol)
+    if not symbol_info:
+        return
+    
+    point = symbol_info.point
+    pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * point)
+    activation_offset = activation_pips * pip_size
+    trail_offset = trailing_pips * pip_size
+    
+    for p in positions:
+        if p.magic != 123456:
+            continue
+        
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            continue
+        
+        new_sl = None
+        if p.type == mt5.POSITION_TYPE_BUY:
+            profit_distance = tick.bid - p.price_open
+            if profit_distance >= activation_offset:
+                candidate_sl = tick.bid - trail_offset
+                # Only move SL upward (lock more profit)
+                if candidate_sl > p.sl + (pip_size * 0.5):
+                    new_sl = candidate_sl
+        
+        elif p.type == mt5.POSITION_TYPE_SELL:
+            profit_distance = p.price_open - tick.ask
+            if profit_distance >= activation_offset:
+                candidate_sl = tick.ask + trail_offset
+                # Only move SL downward (lock more profit)
+                if candidate_sl < p.sl - (pip_size * 0.5):
+                    new_sl = candidate_sl
+        
+        if new_sl is not None:
+            new_sl = round(new_sl / symbol_info.trade_tick_size) * symbol_info.trade_tick_size
+            request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": p.ticket,
+                "symbol": symbol,
+                "sl": float(new_sl),
+                "tp": float(p.tp),
+            }
+            res = mt5.order_send(request)
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info(f"📈 Trailing SL Updated: {symbol} Ticket {p.ticket} | New SL: {new_sl:.5f}")
+            else:
+                logger.warning(f"⚠️ Trailing SL Failed: {symbol} Ticket {p.ticket} | {res.comment if res else 'No response'}")
 
 async def sync_historical_data(managers_dict, db):
     """Fetches history from Local DB (Optimized for speed). Fallback to MT5 if empty."""
@@ -482,8 +543,9 @@ async def run_trading_engine():
             state["last_rl_order_count"] = int(persistent_count)
             logger.info(f"Retraining worker started. Loaded persistent count: {state['last_rl_order_count']}")
         else:
-            state["last_rl_order_count"] = await db.count_closed_trades()
-            logger.info(f"Retraining worker started. initial closed trades: {state['last_rl_order_count']}")
+            # FIX: If never retrained, set to 0 to trigger immediate training if trades exist
+            state["last_rl_order_count"] = 0
+            logger.info("Retraining worker started. No previous retrain found, initialized to 0.")
         
         while True:
             await asyncio.sleep(600) # Check every 10 minutes
@@ -733,6 +795,9 @@ async def run_trading_engine():
                             c = mgr.aggregators[tf_sec].get_last_closed_candle()
                             if c:
                                 await db.log_candle(symbol, label, c)
+                        # Phase 93A: Manage Trailing Stop on every M1 close
+                        if tf_sec == 60:
+                            await manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10)
                 await asyncio.sleep(0.1)
             except Exception as e: logger.error(f"Poller error: {e}"); await asyncio.sleep(1)
 
@@ -745,7 +810,8 @@ async def run_trading_engine():
         # Local state for this worker
         worker_state = {
             "trading_enabled": srv_config.get("trading_enabled", True),
-            "ai_mode": srv_config.get("ai_mode", "EXPLORER")
+            "ai_mode": srv_config.get("ai_mode", "EXPLORER"),
+            "pending_signals": {} # Phase 94: Signals waiting for Heartbeat (pulse)
         }
         
         # 1. Login to MT5 (Requires correct terminal path)
@@ -770,17 +836,57 @@ async def run_trading_engine():
                     await asyncio.sleep(5)
                     continue
                     
-                # Check DB for kill signal
-                # (This would be more complex in production, here we just loop)
-                
                 for symbol in symbols:
                     mgr = mtf_managers.get(symbol)
                     if not mgr or not mgr.is_tf_ready(60): continue
                     
+                    # Phase 94: Handle Pending Signals (Heartbeat Confirmation)
+                    pending_sig = worker_state["pending_signals"].get(symbol)
+                    if pending_sig:
+                        tick = mt5.symbol_info_tick(symbol)
+                        if not tick: continue
+                        
+                        current_time = time.time()
+                        # 60s Timeout for Heartbeat
+                        if current_time - pending_sig['time'] > 60:
+                            logger.warning(f"💓 Heartbeat Timeout: {symbol} signal discarded (No-Pulse).")
+                            del worker_state["pending_signals"][symbol]
+                            continue
+                        
+                        # Confirmation Logic: Move by at least 1 pip in predicted direction
+                        confirmed = False
+                        sym_info = mt5.symbol_info(symbol)
+                        pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * sym_info.point)
+                        if "XAU" in symbol.upper(): pip_size = 0.1
+                        
+                        if pending_sig['action'] == 'BUY':
+                            if tick.ask >= pending_sig['entry'] + (pip_size * 0.5): # confirmed by tiny move
+                                confirmed = True
+                        else:
+                            if tick.bid <= pending_sig['entry'] - (pip_size * 0.5):
+                                confirmed = True
+                                
+                        if confirmed:
+                            logger.info(f"✅ Heartbeat Confirmed: {symbol} @ {tick.ask if pending_sig['action'] == 'BUY' else tick.bid}. Executing.")
+                            await execute_mt5_order(
+                                user_id, symbol, pending_sig['action'], pending_sig['lots'], 
+                                sl=pending_sig['sl'], tp=pending_sig['tp'], 
+                                notifier=notifier, signal_data=pending_sig['signal_data'], db=db
+                            )
+                            del worker_state["pending_signals"][symbol]
+                        continue # Skip AI analysis if we have a pending signal
+
                     # 1. Market Open Check
                     is_open, _ = is_market_open(symbol)
                     if not is_open: continue
                     
+                    # Phase 94: Limit Concurrent Trades (Max 5 per symbol)
+                    MAX_CONCURRENT = srv_config.get("max_concurrent_trades_per_symbol", 8)
+                    positions = mt5.positions_get(symbol=symbol)
+                    if positions and len([p for p in positions if p.magic == 123456]) >= MAX_CONCURRENT:
+                        # logger.debug(f"🚫 Trade Limit Reached for {symbol}: {len(positions)} open positions. Skipping analysis.")
+                        continue
+
                     # 2. MTF Analysis (Shared Model)
                     mtf_inputs = {}
                     for tf in [60, 300, 3600]:
@@ -804,6 +910,26 @@ async def run_trading_engine():
                         symbol=symbol
                     )
                     
+                    # Phase 93B: Profit Target Check
+                    PROFIT_TARGET_PIPS = srv_config.get("profit_target_pips", 15)
+                    if positions:
+                        sym_info_pt = mt5.symbol_info(symbol)
+                        pt_point = sym_info_pt.point if sym_info_pt else 0.00001
+                        pt_pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * pt_point)
+                        for p in positions:
+                            if p.magic != 123456: continue
+                            tick_pt = mt5.symbol_info_tick(symbol)
+                            if not tick_pt: continue
+                            if p.type == mt5.POSITION_TYPE_BUY:
+                                profit_pips = (tick_pt.bid - p.price_open) / pt_pip_size
+                            else:
+                                profit_pips = (p.price_open - tick_pt.ask) / pt_pip_size
+                            
+                            if profit_pips >= PROFIT_TARGET_PIPS:
+                                logger.info(f"🎯 Profit Target Hit: {symbol} Ticket {p.ticket} | +{profit_pips:.1f} pips. Closing.")
+                                trade_exe_logger.info(f"CLOSE_PROFIT_TARGET: {symbol} | Ticket: {p.ticket} | Pips: +{profit_pips:.1f}")
+                                await close_all_positions(user_id, symbol, action_type=p.type, notifier=notifier, db=db)
+                    
                     if signal['action'] != 'HOLD':
                         # 3. Execution (User-Specific)
                         trade_logger.info(f"SIGNAL: {username} | {symbol} {signal['action']} (Confidence: {signal['confidence']:.2f})")
@@ -812,49 +938,44 @@ async def run_trading_engine():
                         account = mt5.account_info()
                         current_equity = account.equity if account else 1000.0
                         
-                        # Reversal Logic
-                        current_mode = worker_state.get("ai_mode", "EXPLORER")
-                        default_threshold = 0.60 if current_mode == "EXPLORER" else 0.65
-                        reversal_threshold = srv_config.get("reversal_confidence_threshold", default_threshold)
-                        
-                        if signal['confidence'] >= reversal_threshold:
-                            target_to_close = mt5.POSITION_TYPE_SELL if signal['action'] == 'BUY' else mt5.POSITION_TYPE_BUY
-                            await close_all_positions(user_id, symbol, action_type=target_to_close, notifier=notifier, db=db)
+                        # Phase 94.5: Profit-Harvest Reversal Logic
+                        # If the new signal contradicts existing positions and those positions are net profitable, 
+                        # we flush them all to harvest profit before entering the new direction.
+                        current_positions = [p for p in positions if p.magic == 123456]
+                        if current_positions:
+                            opp_type = mt5.POSITION_TYPE_SELL if signal['action'] == 'BUY' else mt5.POSITION_TYPE_BUY
+                            opposite_positions = [p for p in current_positions if p.type == opp_type]
+                            
+                            if opposite_positions:
+                                total_opp_profit = sum(p.profit for p in opposite_positions)
+                                if total_opp_profit > 0:
+                                    logger.info(f"🔄 Profit-Harvest Reversal: {symbol} has {len(opposite_positions)} opposite positions with Net Profit ${total_opp_profit:.2f}. Flushing all.")
+                                    # Close ALL positions for this symbol to start fresh
+                                    await close_all_positions(user_id, symbol, notifier=notifier, db=db)
+                                    # Update positions list for subsequent logic
+                                    positions = mt5.positions_get(symbol=symbol) or []
                         
                         # Risk Calculation
                         tick = mt5.symbol_info_tick(symbol)
                         entry_price = tick.ask if signal['action'] == 'BUY' else tick.bid
                         
-                        # Phase 92: Accurate Pip-to-Dollar Calculation
                         symbol_info = mt5.symbol_info(symbol)
                         point = symbol_info.point
                         tick_size = symbol_info.trade_tick_size
-                        tick_value = symbol_info.trade_tick_value # Profit in currency for 1 tick move
+                        tick_value = symbol_info.trade_tick_value
                         
-                        # Define "Pip" (Standard defined as 10 points for most symbols)
                         pip_price_offset = 0.01 if "JPY" in symbol.upper() else (10.0 * point)
-                        if "XAU" in symbol.upper(): pip_price_offset = 0.1 # Gold standard pip
-                        
-                        # Correct Pip Value (Dollar profit per 1 Lot for 1 Pip move)
-                        # Formula: (Pip Offset / Tick Size) * Tick Value
+                        if "XAU" in symbol.upper(): pip_price_offset = 0.1
                         dollar_value_per_pip = (pip_price_offset / tick_size) * tick_value
                         
-                        # 1. Calculate risk-based lot size
                         risk_lots = risk_manager.calculate_lot_size(
                             current_equity, 20, confidence=signal['confidence'], 
                             pip_value=dollar_value_per_pip, commission_per_lot=srv_config.get("commission_per_lot", 7.0)
                         )
-                        
-                        # 2. Calculate affordable lot size based on Free Margin
                         account_info = mt5.account_info()
                         free_margin = account_info.margin_free if account_info else 0.0
                         affordable_lots = risk_manager.calculate_max_affordable_lots(symbol, signal['action'], free_margin, mt5_module=mt5)
-                        
-                        # 3. Final Lot Size (Risk-based capped by Affordable)
                         lot_size = min(risk_lots, affordable_lots)
-                        
-                        trade_logger.info(f"LOTS: {username} | {symbol} | Risk: {risk_lots}, FreeMargin: {free_margin}, Affordable: {affordable_lots} -> Final: {lot_size}")
-                        logger.info(f"💰 Lot Calculation for {username} ({symbol}): Risk={risk_lots}, Affordable={affordable_lots} -> Final={lot_size}")
                         
                         if lot_size < symbol_info.volume_min:
                             logger.warning(f"⚠️ {username}: Final lot size {lot_size} is below minimum {symbol_info.volume_min}. Skipping trade.")
@@ -862,11 +983,21 @@ async def run_trading_engine():
 
                         sl, tp = risk_manager.calculate_sl_tp(
                             symbol, signal['action'], entry_price, 
-                            stop_loss_pips=20, point=point, tick_size=symbol_info.trade_tick_size
+                            stop_loss_pips=20, point=point, tick_size=symbol_info.trade_tick_size,
+                            confidence=signal['confidence']
                         )
                         
-                        # Execute
-                        await execute_mt5_order(user_id, symbol, signal['action'], lot_size, sl=sl, tp=tp, notifier=notifier, signal_data=signal, db=db)
+                        # Phase 94: Store as Pending Signal (Wait for Heartbeat)
+                        worker_state["pending_signals"][symbol] = {
+                            "action": signal['action'],
+                            "entry": entry_price,
+                            "lots": lot_size,
+                            "sl": sl,
+                            "tp": tp,
+                            "time": time.time(),
+                            "signal_data": signal
+                        }
+                        logger.info(f"💓 Heartbeat Pending: {symbol} {signal['action']} @ {entry_price}... waiting for confirmation.")
                 
                 await asyncio.sleep(0.5)
         except Exception as e:

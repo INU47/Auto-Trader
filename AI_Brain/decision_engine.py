@@ -93,62 +93,77 @@ class DecisionEngine:
             }
 
         if m1:
-            # 2. Confluence Logic
-            # Include all bullish patterns: 1(Bullish), 3(Hammer), 5(Engulfing), 7(Morning Star)
+            # 2. Confluence Logic & Weighted Confidence (Phase 96)
+            # Weights: M1=0.5, M5=0.3, H1=0.2
             is_bullish = m1['class'] in [1, 3, 5, 7] and m1['trend'] > 0
-            
-            # Include all bearish patterns: 2(Bearish), 4(Shooting Star), 6(Engulfing), 8(Evening Star)
             is_bearish = m1['class'] in [2, 4, 6, 8] and m1['trend'] < 0
             
-            # Additional Trend Confirmation (Optional in Explorer)
+            # Calculate Base Weighted Confidence
+            conf_score = m1['conf'] * 0.5
+            if m5:
+                # Add M5 weight if it agrees with M1 trend, else penalize
+                weight = 0.3
+                if (is_bullish and m5['trend'] > 0) or (is_bearish and m5['trend'] < 0):
+                    conf_score += m5['conf'] * weight
+                else:
+                    conf_score -= m5['conf'] * weight # Penalty for contradiction
+            
+            if h1:
+                weight = 0.2
+                if (is_bullish and h1['trend'] > 0) or (is_bearish and h1['trend'] < 0):
+                    conf_score += h1['conf'] * weight
+                else:
+                    conf_score -= h1['conf'] * weight
+            
+            # Clamp final confidence [0, 1]
+            final_conf = max(0.0, min(1.0, conf_score))
+
             if ai_mode == "EXPLORER":
-                # If higher TFs exist, use them as filters, else allow M1 Solo
                 bull_confirmed = True if not (m5 or h1) else ((m5['trend'] > 0 if m5 else False) or (h1['trend'] > 0 if h1 else False))
                 bear_confirmed = True if not (m5 or h1) else ((m5['trend'] < 0 if m5 else False) or (h1['trend'] < 0 if h1 else False))
-                
-                # Confidence Threshold Relaxation (Explorer: 0.65)
-                min_conf = 0.6
+                min_conf = 0.5 # Relaxed because weighted score is harder to keep high
             else:
-                # Conservative remains strict: needs ALL
                 if not (m5 and h1): return signal
                 bull_confirmed = (m5['trend'] > 0 and h1['trend'] > 0)
                 bear_confirmed = (m5['trend'] < 0 and h1['trend'] < 0)
-                min_conf = 0.65
+                min_conf = 0.6
 
             # Generate Report Components
             pattern_text = pattern_names.get(m1['class'], "Unknown")
             is_uptrend = m1['trend'] > 0
             future_outlook = "ขาขึ้นแข็งแกร่ง" if is_uptrend else "แนวโน้มขาลง"
-            confidence_pct = int(m1['conf'] * 100)
 
             # Metadata for Analyst
             analyst_data = {
                 'pattern': pattern_text,
                 'future_outlook': future_outlook,
                 'is_uptrend': is_uptrend,
-                'confidence': m1['conf']
+                'confidence': final_conf, # Using weighted
+                'm1_conf': m1['conf'],
+                'm5_trend': m5['trend'] if m5 else 0,
+                'h1_trend': h1['trend'] if h1 else 0
             }
             
             # Helper for LSTM Confidence
             trend_val = m1['trend']
             lstm_conf = min(abs(trend_val) / 50.0, 1.0)
 
-            if is_bullish and bull_confirmed and m1['conf'] >= min_conf:
+            if is_bullish and bull_confirmed and final_conf >= min_conf:
                 signal = {
                     'action': 'BUY', 
-                    'confidence': m1['conf'], 
-                    'reason': f'MTF Bullish {ai_mode}',
+                    'confidence': final_conf, 
+                    'reason': f'MTF Bullish {ai_mode} (W-Conf: {final_conf:.2f})',
                     'analyst_metadata': analyst_data,
                     'raw_cnn_class': m1['class'],  
                     'raw_lstm_trend': m1['trend'],
                     'raw_lstm_conf': lstm_conf,
                     'ai_mode': ai_mode
                 }
-            elif is_bearish and bear_confirmed and m1['conf'] >= min_conf:
+            elif is_bearish and bear_confirmed and final_conf >= min_conf:
                 signal = {
                     'action': 'SELL', 
-                    'confidence': m1['conf'], 
-                    'reason': f'MTF Bearish {ai_mode}',
+                    'confidence': final_conf, 
+                    'reason': f'MTF Bearish {ai_mode} (W-Conf: {final_conf:.2f})',
                     'analyst_metadata': analyst_data,
                     'raw_cnn_class': m1['class'],  
                     'raw_lstm_trend': m1['trend'],
@@ -157,8 +172,8 @@ class DecisionEngine:
                 }
             else:
                 # Capture pattern detections even if no trade action is taken
-                if m1['conf'] < min_conf:
-                    logger.info(f"⚠️ Signal Skipped: {symbol} Pattern {pattern_text} | Conf {m1['conf']:.2f} < {min_conf}")
+                if final_conf < min_conf:
+                    logger.info(f"⚠️ Signal Skipped: {symbol} Pattern {pattern_text} | W-Conf {final_conf:.2f} < {min_conf}")
                 signal['analyst_metadata'] = analyst_data
                 signal['raw_cnn_class'] = m1['class']
                 signal['raw_lstm_trend'] = m1['trend']
@@ -186,11 +201,23 @@ class RiskManager:
     def __init__(self, risk_per_trade=0.01):
         self.risk_per_trade = risk_per_trade 
 
-    def calculate_sl_tp(self, symbol, action, entry_price, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001, commission_buffer_pips=2.0):
-        """Calculates precise price levels for SL and TP based on pips and tick_size"""
+    def calculate_sl_tp(self, symbol, action, entry_price, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001, commission_buffer_pips=2.0, confidence=None):
+        """Calculates precise price levels for SL and TP based on pips and tick_size.
+        
+        If confidence is provided, the reward_ratio is computed dynamically:
+          - confidence 0.55 → RR 1.0 (TP = SL distance)
+          - confidence 0.70 → RR 1.5
+          - confidence 0.85+ → RR 2.0
+        """
         # Phase 87: Handle JPY pairs (usually 3 decimal places, pip is 0.01)
         is_jpy = "JPY" in symbol.upper()
         pip_value = 0.01 if is_jpy else (10 * point)
+        
+        # Phase 93C: Dynamic RR based on AI confidence
+        if confidence is not None:
+            # Clamp confidence to [0.55, 0.85] and map to RR [1.0, 2.0]
+            conf_clamped = max(0.55, min(0.85, confidence))
+            reward_ratio = 1.0 + ((conf_clamped - 0.55) / 0.30) * 1.0
         
         sl_offset = stop_loss_pips * pip_value
         # TP includes the buffer to ensure net profit after commission

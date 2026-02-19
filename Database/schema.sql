@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS trade_logs (
     
     -- Status & Analytics
     status TEXT DEFAULT 'OPEN', -- 'OPEN', 'CLOSED'
-    close_reason TEXT -- 'SL', 'TP', 'MANUAL', 'REVERSAL', etc.
+    close_reason TEXT
 );
 
 -- Table: llm_training_logs (LLM Mentor Feedback for RL Training)

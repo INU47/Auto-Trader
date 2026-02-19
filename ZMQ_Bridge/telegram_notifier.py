@@ -53,7 +53,7 @@ class TelegramNotifier:
             logger.error(f"Failed to send Telegram message: {e}")
 
     def get_main_menu(self):
-        """Returns a standard button layout for the bot"""
+        """Returns standard keyboard buttons for the bot control."""
         return {
             "keyboard": [
                 [{"text": "/info"}, {"text": "/history"}],
@@ -64,7 +64,7 @@ class TelegramNotifier:
         }
 
     async def check_commands(self):
-        """Polls for NEW commands since last check"""
+        """Polls for new commands from Telegram."""
         if not self.enabled: return []
         
         try:
@@ -83,10 +83,18 @@ class TelegramNotifier:
                             message = update.get("message", {})
                             text = message.get("text", "")
                             from_id = str(message.get("from", {}).get("id", ""))
+                            chat_id_msg = str(message.get("chat", {}).get("id", ""))
+                            expected_chat_id = str(self.chat_id)
                             
-                            if from_id == str(self.chat_id) and text:
+                            logger.info(f"📨 Update received: from_id={from_id}, chat_id={chat_id_msg}, expected={expected_chat_id}, text='{text}'")
+                            
+                            # Match on EITHER from.id OR chat.id to handle both private and group chats
+                            if (from_id == expected_chat_id or chat_id_msg == expected_chat_id) and text:
                                 new_cmds.append(text.lower().strip())
-                        return new_cmds
+                                logger.info(f"✅ Command accepted: {text}")
+                            else:
+                                logger.warning(f"⚠️ Command rejected: from_id={from_id}, chat_id={chat_id_msg} != expected={expected_chat_id}")
+                    return new_cmds
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError):
             pass # Transient network issues are common and harmless
         except httpx.HTTPStatusError as e:
