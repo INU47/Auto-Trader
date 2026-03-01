@@ -6,10 +6,10 @@ from datetime import datetime
 logger = logging.getLogger("Preprocessor")
 
 class CandleAggregator:
-    def __init__(self, timeframe_seconds=3600): # Default H1
+    def __init__(self, timeframe_seconds=3600):
         self.tf_seconds = timeframe_seconds
         self.current_candle = None
-        self.last_closed_candle = None # Store for retrieval
+        self.last_closed_candle = None
         
     def add_tick(self, tick_data):
         """
@@ -21,36 +21,34 @@ class CandleAggregator:
         ts_ms = tick_data.get('time', int(datetime.now().timestamp() * 1000))
         ts_sec = ts_ms / 1000.0
         
-        # Calculate Candle Start Time (Align to timeframe)
         candle_start_time = int(ts_sec // self.tf_seconds) * self.tf_seconds
         
-        # If new candle period
         completed_candle = None
         if self.current_candle is None:
-            self._init_candle(candle_start_time, price)
+            self._init_candle(candle_start_time, price, tick_data)
         elif candle_start_time > self.current_candle['time']:
-            # Close previous
             completed_candle = self.current_candle.copy()
-            self.last_closed_candle = completed_candle # Stored
-            # Start new
-            self._init_candle(candle_start_time, price)
+            self.last_closed_candle = completed_candle
+            self._init_candle(candle_start_time, price, tick_data)
         else:
-            # Update current
             self.current_candle['high'] = max(self.current_candle['high'], price)
             self.current_candle['low'] = min(self.current_candle['low'], price)
             self.current_candle['close'] = price
             self.current_candle['tick_volume'] += 1
+            if 'sentiment' in tick_data:
+                self.current_candle['sentiment'] = tick_data['sentiment']
             
         return completed_candle
 
-    def _init_candle(self, start_time, price):
+    def _init_candle(self, start_time, price, tick_data=None):
         self.current_candle = {
             'time': start_time,
             'open': price,
             'high': price,
             'low': price,
             'close': price,
-            'tick_volume': 1
+            'tick_volume': 1,
+            'sentiment': tick_data.get('sentiment', 0.0) if tick_data else 0.0
         }
     
     def get_current_candle(self):
@@ -58,22 +56,45 @@ class CandleAggregator:
 
     def get_last_closed_candle(self):
         return self.last_closed_candle
-
 class SlidingWindowBuffer:
-    def __init__(self, window_size=32, features=['open', 'high', 'low', 'close', 'tick_volume']):
+    def __init__(self, window_size=32, features=['open', 'high', 'low', 'close', 'tick_volume', 'sentiment']):
         self.window_size = window_size
         self.features = features
-        self.data = pd.DataFrame(columns=features)
-    
+        self.data = pd.DataFrame(columns=features + ['rsi', 'macd_sig', 'macd_hist', 'atr'])
+
+    def _calculate_indicators(self):
+        if len(self.data) < 26: return
+        
+        close = self.data['close']
+        
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 1e-8)
+        self.data['rsi'] = (100 - (100 / (1 + rs))) / 100.0
+        
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        
+        self.data['macd_sig'] = signal_line
+        self.data['macd_hist'] = macd_line - signal_line
+        
+        prev_close = close.shift(1)
+        tr1 = self.data['high'] - self.data['low']
+        tr2 = abs(self.data['high'] - prev_close)
+        tr3 = abs(self.data['low'] - prev_close)
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        self.data['atr'] = tr.rolling(window=14).mean()
+        
+        self.data.ffill(inplace=True)
+        self.data.fillna(0, inplace=True)
+
     def add_candle(self, candle_dict):
-        """
-        Add a full candle dictionary to the buffer.
-        """
-        # Filter only required keys
         filtered = {k: candle_dict[k] for k in self.features if k in candle_dict}
         new_row = pd.DataFrame([filtered])
         
-        # Concat
         if not new_row.empty:
             if self.data.empty:
                 self.data = new_row
@@ -82,6 +103,9 @@ class SlidingWindowBuffer:
         
         if len(self.data) > self.window_size:
             self.data = self.data.iloc[-self.window_size:]
+        
+        if len(self.data) >= 26:
+            self._calculate_indicators()
             
     def get_data(self):
         return self.data.copy()
@@ -90,21 +114,13 @@ class SlidingWindowBuffer:
         return len(self.data) >= self.window_size
 
 class MTFManager:
-    """
-    Manages multiple timeframes (M1, M5, H1) by coordinating multiple 
-    aggregators and buffers.
-    """
     def __init__(self, timeframes=[60, 300, 3600], window_size=32):
-        self.timeframes = timeframes # in seconds
+        self.timeframes = timeframes
         self.aggregators = {tf: CandleAggregator(timeframe_seconds=tf) for tf in timeframes}
         self.buffers = {tf: SlidingWindowBuffer(window_size=window_size) for tf in timeframes}
         self.ready_signals = {tf: False for tf in timeframes}
 
     def add_tick(self, tick_data):
-        """
-        Feeds a tick into all aggregators.
-        Returns a list of timeframes that just closed a candle.
-        """
         closed_tfs = []
         for tf, agg in self.aggregators.items():
             new_candle = agg.add_tick(tick_data)
@@ -125,7 +141,6 @@ class GAFTransformer:
         self.image_size = image_size
 
     def transform(self, series):
-        # 1. Min-Max Scale to [-1, 1]
         min_val = np.min(series)
         max_val = np.max(series)
         
@@ -134,7 +149,6 @@ class GAFTransformer:
         else:
             scaled_series = ((series - min_val) / (max_val - min_val)) * 2 - 1
             
-        # 2. Polar encoding & Gramian field
         scaled_series = np.clip(scaled_series, -1.0, 1.0)
         phi = np.arccos(scaled_series)
         

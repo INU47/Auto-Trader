@@ -8,7 +8,8 @@ import datetime
 import os
 import MetaTrader5 as mt5
 from AI_Brain.preprocessor import SlidingWindowBuffer, GAFTransformer, CandleAggregator, MTFManager
-from AI_Brain.models import PatternCNN, TrendLSTM
+from AI_Brain.models import HybridModel, get_best_hyperparams
+from AI_Brain.sentiment_analyzer import SentimentAnalyzer
 from AI_Brain.decision_engine import DecisionEngine, RiskManager
 from Database.db_handler import DBHandler
 from ZMQ_Bridge.telegram_notifier import TelegramNotifier
@@ -17,36 +18,30 @@ import subprocess
 from AI_Brain.llm_advisor import LLMRewardAdvisor
 from AI_Brain.training_pipeline import train_rl_mode
 
-# Setup Logging (Hardened)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 
-# Clear existing handlers if any (to prevent duplicates/locks)
 if root_logger.hasHandlers():
     root_logger.handlers.clear()
 
 log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 formatter = logging.Formatter(log_format)
 
-# 1. Main System Log
 file_handler = logging.FileHandler("quant_system.log", mode='a', encoding='utf-8')
 file_handler.setFormatter(formatter)
 root_logger.addHandler(file_handler)
 
-# 2. Error Log (System-wide ERROR and CRITICAL)
 err_handler = logging.FileHandler("errors.log", mode='a', encoding='utf-8')
 err_handler.setFormatter(formatter)
 err_handler.setLevel(logging.ERROR)
 root_logger.addHandler(err_handler)
 
-# 3. All Trades (Signals + Execution Attempts)
 trade_all_handler = logging.FileHandler("trades_all.log", mode='a', encoding='utf-8')
 trade_all_handler.setFormatter(formatter)
 trade_logger = logging.getLogger("Trade")
 trade_logger.setLevel(logging.INFO)
 trade_logger.addHandler(trade_all_handler)
 
-# 4. Executed Trades Only
 trade_exe_handler = logging.FileHandler("trades_executed.log", mode='a', encoding='utf-8')
 trade_exe_handler.setFormatter(formatter)
 trade_exe_logger = logging.getLogger("Trade.Executed")
@@ -57,7 +52,6 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 root_logger.addHandler(console_handler)
 
-# Silence verbose third-party libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 logger = logging.getLogger("Main")
@@ -65,7 +59,6 @@ logger.info("="*50)
 logger.info("--- SYSTEM STARTUP ---")
 logger.info("="*50)
 
-# Shared HTTP Client for Dashboard
 dashboard_client = None
 
 async def post_to_dashboard(data):
@@ -80,7 +73,7 @@ async def post_to_dashboard(data):
         if resp.status_code != 200:
             logger.warning(f"Dashboard push failed: {resp.status_code}")
     except Exception:
-        pass # Dashboard might be offline
+        pass
 
 def get_filling_type(symbol):
     """Dynamically detects the supported filling mode for a symbol/broker"""
@@ -89,47 +82,51 @@ def get_filling_type(symbol):
         return mt5.ORDER_FILLING_IOC
         
     filling_mode = symbol_info.filling_mode
-    if filling_mode & 1: # SYMBOL_FILLING_FOK
+    if filling_mode & 1:
         return mt5.ORDER_FILLING_FOK
-    elif filling_mode & 2: # SYMBOL_FILLING_IOC
+    elif filling_mode & 2:
         return mt5.ORDER_FILLING_IOC
     else:
         return mt5.ORDER_FILLING_RETURN
+
+def get_pip_size(symbol):
+    info = mt5.symbol_info(symbol)
+    if not info: return 0.0001
+    
+    s_upper = symbol.upper()
+    if "XAU" in s_upper or "GOLD" in s_upper: return 0.1
+    if "JPY" in s_upper: return 0.01
+    
+    if info.digits in [2, 3]: return 0.01
+    if info.digits in [0, 1]: return 1.0 
+    
+    return 0.0001
 
 def is_market_open(symbol):
     """
     Checks if the market for a specific symbol is open for full trading.
     Returns: (bool, message)
     """
-    # 1. Global Terminal Trade Permission
     terminal = mt5.terminal_info()
     if not terminal or not terminal.trade_allowed:
         return False, "Broker/Terminal trade permission denied (Global)."
 
-    # 2. Symbol-Specific Permission
     info = mt5.symbol_info(symbol)
     if info is None:
         return False, f"Symbol {symbol} info not found."
     
-    # trade_mode: 0=Disabled, 1=LongOnly, 2=ShortOnly, 3=CloseOnly, 4=Full
     if info.trade_mode == mt5.SYMBOL_TRADE_MODE_DISABLED:
         return False, "Market is completely CLOSED for this symbol."
     elif info.trade_mode == mt5.SYMBOL_TRADE_MODE_CLOSEONLY:
         return False, "Market is CLOSE-ONLY (No new entries allowed)."
         
-    # Phase 91: Pre-Market Close Protection (Friday Night)
-    # Most Forex markets close around Saturday 04:00-05:00 (Thai Time)
-    # We stop new entries 4 hours before the estimated close to avoid high spread/volatility errors.
-    # Stop at Midnight Friday (Friday 23:59:59)
     now = datetime.datetime.now()
-    if now.weekday() == 4: # Friday
-        if now.hour >= 23: # Stop at 11 PM Friday
+    if now.weekday() == 4:
+        if now.hour >= 23:
             return False, "Friday Night Protection: Market nearing weekly close. Volatility too high."
-    elif now.weekday() == 5: # Saturday
+    elif now.weekday() == 5:
         return False, "Market is closed for the weekend."
     
-    # Note: LongOnly or ShortOnly are rare but allowed for specific directions.
-    # We primarily look for SYMBOL_TRADE_MODE_FULL for general trading.
     if info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
         return False, f"Market restricted (Trade Mode: {info.trade_mode})."
 
@@ -137,26 +134,20 @@ def is_market_open(symbol):
 
 async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifier=None, signal_data=None, db=None):
     """Executes a trade on MT5 for a specific user and logs it globally."""
-    # Ensure correct MT5 instance is used (if multiple terminals, this would involve switching)
-    # For now, we assume the worker manages the connection state.
     
-    # 1. Prepare Request
     try:
-        # 0. Check if MT5 is actually initialized
         if not mt5.terminal_info():
             msg = "❌ **MT5 Error**: Terminal not connected or initialized."
             logger.error(msg)
             if notifier: await notifier.send_message(msg)
             return None
 
-        # 1. Ensure symbol is selected and visible
         if not mt5.symbol_select(symbol, True):
             msg = f"❌ **MT5 Error**: Symbol {symbol} not found or cannot be selected."
             logger.error(msg)
             if notifier: await notifier.send_message(msg)
             return None
 
-        # 1.5 Market Open Check
         is_open, mkt_msg = is_market_open(symbol)
         if not is_open:
             msg = f"🕰️ **Market Closed**: {symbol}\n📝 {mkt_msg}"
@@ -164,7 +155,6 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
             if notifier: await notifier.send_message(msg)
             return None
 
-        # 2. Get latest tick
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             msg = f"❌ **MT5 Error**: Could not get price for {symbol}."
@@ -176,7 +166,6 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
         order_type = mt5.ORDER_TYPE_BUY if action.upper() == "BUY" else mt5.ORDER_TYPE_SELL
         price = tick.ask if action.upper() == "BUY" else tick.bid
         
-        # Detect Filling Type dynamically
         filling_type = get_filling_type(symbol)
 
         request = {
@@ -193,7 +182,6 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
             "type_filling": filling_type,
         }
         
-        # 3. Send Order
         result = mt5.order_send(request)
         if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
             msg = f"❌ **Order Failed**: {result.comment if result else 'None'} (Code: {result.retcode if result else 'N/A'})"
@@ -203,7 +191,6 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
             return None
         else:
             reason = signal_data.get('reason', 'N/A') if signal_data else 'Manual/Unknown'
-            # Enhanced Notification
             msg = (
                 f"✅ **Order Executed**\n\n"
                 f"🎫 **Ticket**: {result.order}\n"
@@ -218,20 +205,16 @@ async def execute_mt5_order(user_id, symbol, action, volume, sl=0, tp=0, notifie
             trade_exe_logger.info(f"ORDER_{result.order}: {action} {volume} {symbol} @ {result.price} | SL: {sl} | TP: {tp} | Reason: {reason}")
             if notifier: await notifier.send_message(msg)
         
-        # 4. Log Trade Entry for RL
         if db and signal_data:
-            # Phase 91: Universal Position Tracking via Deal Mapping
-            # This is 100% reliable as it queries the deal that actually executed.
-            await asyncio.sleep(1.0) # Ensure MT5 history is updated
+            await asyncio.sleep(1.0)
             deal_ticket = result.deal
-            position_ticket = result.order # Default
+            position_ticket = result.order
             
             history_deal = mt5.history_deals_get(ticket=deal_ticket)
             if history_deal:
                 position_ticket = history_deal[0].position_id
                 logger.info(f"🔗 Linked Deal {deal_ticket} to Position {position_ticket}")
             else:
-                # Fallback to position search if deal history is slow
                 positions = mt5.positions_get(symbol=symbol)
                 if positions:
                     for p in positions:
@@ -255,7 +238,6 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
         return
 
     for p in positions:
-        # Match by Magic Number (Hardcoded for this bot version)
         if p.magic != 123456:
             continue
             
@@ -282,12 +264,10 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
 
         res = mt5.order_send(request)
         if res.retcode == mt5.TRADE_RETCODE_DONE:
-            # RL Logging: Fetch profit details
             await asyncio.sleep(0.5)
             deals = mt5.history_deals_get(position=p.ticket)
             total_profit = sum([d.profit + d.swap + d.commission for d in deals]) if deals else 0.0
             
-            # Standardized Notification
             msg = (
                 f"🎯 **Position Closed**\n\n"
                 f"🎫 **Ticket**: {p.ticket}\n"
@@ -306,13 +286,7 @@ async def close_all_positions(user_id, symbol, action_type=None, notifier=None, 
         else:
             logger.error(f"Failed to close {p.ticket} for User {user_id}: {res.comment}")
 
-async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10):
-    """Phase 93A: Trailing Stop Management.
-    
-    When a position's profit reaches `activation_pips`, the SL is moved
-    to trail the current price by `trailing_pips`. SL only moves in the
-    profitable direction — never against the trade.
-    """
+async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10, db=None, mtf_managers=None):
     positions = mt5.positions_get(symbol=symbol)
     if not positions:
         return
@@ -320,11 +294,20 @@ async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10):
     symbol_info = mt5.symbol_info(symbol)
     if not symbol_info:
         return
-    
+        
     point = symbol_info.point
-    pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * point)
+    pip_size = get_pip_size(symbol)
+    
+    mgr = mtf_managers.get(symbol) if mtf_managers else None
+    current_atr = 0.0002
+    if mgr:
+        df = mgr.get_data_for_tf(60)
+        if not df.empty and 'atr' in df.columns:
+            current_atr = df['atr'].iloc[-1]
+            
+    trail_offset = max(trailing_pips * pip_size, current_atr * 1.5)
     activation_offset = activation_pips * pip_size
-    trail_offset = trailing_pips * pip_size
+    be_buffer = 1.0 * pip_size
     
     for p in positions:
         if p.magic != 123456:
@@ -337,20 +320,34 @@ async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10):
         new_sl = None
         if p.type == mt5.POSITION_TYPE_BUY:
             profit_distance = tick.bid - p.price_open
+            
             if profit_distance >= activation_offset:
-                candidate_sl = tick.bid - trail_offset
-                # Only move SL upward (lock more profit)
-                if candidate_sl > p.sl + (pip_size * 0.5):
-                    new_sl = candidate_sl
-        
+                be_level = p.price_open + be_buffer
+                if p.sl < be_level:
+                    new_sl = be_level
+                    logger.info(f"🛡️ BE Triggered: {symbol} Ticket {p.ticket} moved to BE.")
+            
+            if profit_distance >= trail_offset:
+                candidate_trail_sl = tick.bid - trail_offset
+                if candidate_trail_sl > (new_sl if new_sl else p.sl) + (point * 10):
+                    new_sl = candidate_trail_sl
+
         elif p.type == mt5.POSITION_TYPE_SELL:
             profit_distance = p.price_open - tick.ask
+            
             if profit_distance >= activation_offset:
-                candidate_sl = tick.ask + trail_offset
-                # Only move SL downward (lock more profit)
-                if candidate_sl < p.sl - (pip_size * 0.5):
-                    new_sl = candidate_sl
-        
+                be_level = p.price_open - be_buffer
+                if p.sl == 0 or p.sl > be_level:
+                    new_sl = be_level
+                    logger.info(f"🛡️ BE Triggered: {symbol} Ticket {p.ticket} moved to BE.")
+            
+            if profit_distance >= trail_offset:
+                candidate_trail_sl = tick.ask + trail_offset
+                if p.sl != 0 and (candidate_trail_sl < (new_sl if new_sl else p.sl) - (point * 10)):
+                    new_sl = candidate_trail_sl
+                elif p.sl == 0:
+                    new_sl = candidate_trail_sl
+
         if new_sl is not None:
             new_sl = round(new_sl / symbol_info.trade_tick_size) * symbol_info.trade_tick_size
             request = {
@@ -362,11 +359,11 @@ async def manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10):
             }
             res = mt5.order_send(request)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info(f"📈 Trailing SL Updated: {symbol} Ticket {p.ticket} | New SL: {new_sl:.5f}")
+                logger.debug(f"📈 SL Updated: {symbol} Ticket {p.ticket} | New SL: {new_sl:.5f}")
             else:
-                logger.warning(f"⚠️ Trailing SL Failed: {symbol} Ticket {p.ticket} | {res.comment if res else 'No response'}")
+                logger.warning(f"⚠️ SL Update Failed: {symbol} Ticket {p.ticket} | {res.comment if res else 'No response'}")
 
-async def sync_historical_data(managers_dict, db):
+async def sync_historical_data(managers_dict, db, window_size=32):
     """Fetches history from Local DB (Optimized for speed). Fallback to MT5 if empty."""
     DAYS = 7
     logger.info(f"🔄 Syncing History: Fetching last {DAYS} days of data from Database...")
@@ -379,35 +376,12 @@ async def sync_historical_data(managers_dict, db):
     
     for symbol in symbols:
         if symbol not in managers_dict:
-            managers_dict[symbol] = MTFManager(timeframes=[60, 300, 3600], window_size=32)
+            managers_dict[symbol] = MTFManager(timeframes=[60, 300, 3600], window_size=window_size)
             
         for tf_sec, tf_label in {60: 'M1', 300: 'M5', 3600: 'H1'}.items():
-            # 1. Try DB first
-            candles = await db.get_candles(symbol, tf_label, days=DAYS)
+            await db.ensure_data_continuity(symbol, tf_label, target_candles=5000)
             
-            # 2. Fallback to MT5 if DB is empty for this symbol/TF (initial run)
-            if not candles:
-                logger.info(f"  [!] DB Empty for {symbol} {tf_label}. Quick backfill from MT5...")
-                if not mt5.terminal_info():
-                    mt5.initialize(login=config['login'], server=config['server'], password=config['password'])
-                
-                mt5_tf = {60: mt5.TIMEFRAME_M1, 300: mt5.TIMEFRAME_M5, 3600: mt5.TIMEFRAME_H1}.get(tf_sec)
-                # Fetch 2 days from MT5 as a quick backfill if DB is empty
-                count = (2 * 24 * 60) if tf_sec == 60 else (2 * 24 * 12) if tf_sec == 300 else (2 * 24)
-                rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
-                if rates is not None:
-                    mt5_candles = []
-                    for rate in rates:
-                        mt5_candles.append({
-                            'symbol': symbol, 'timeframe': tf_label,
-                            'open': float(rate['open']), 'high': float(rate['high']), 
-                            'low': float(rate['low']), 'close': float(rate['close']), 
-                            'tick_volume': int(rate['tick_volume']), 'time': int(rate['time'])
-                        })
-                    await db.log_candles_batch(mt5_candles)
-                    candles = await db.get_candles(symbol, tf_label, days=DAYS)
-
-            # 3. Populate Buffers & Dashboard Batch
+            candles = await db.get_candles(symbol, tf_label, days=DAYS)
             for i, candle in enumerate(candles):
                 if len(candles) - i <= 500:
                     managers_dict[symbol].buffers[tf_sec].add_candle(candle)
@@ -422,35 +396,58 @@ async def run_trading_engine():
     """Main Orchestrator for Multi-User Trading System."""
     logger.info("Starting Multi-User Trading Orchestrator...")
     
-    # 1. Initialize Global Components
     db = DBHandler()
     await db.connect()
     
     with open("Config/server_config.json", "r") as f: srv_config = json.load(f)
     
-    notifier = TelegramNotifier()  # Uses default config path
+    notifier = TelegramNotifier()
     gaf_transformer = GAFTransformer()
-    # Shared AI Models
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cnn = PatternCNN().to(device)
-    lstm = TrendLSTM(input_size=5, hidden_size=64, dropout=0.3).to(device)
+    sentiment_analyzer = SentimentAnalyzer()
     
-    if os.path.exists("AI_Brain/weights/cnn_model.pt"):
-        cnn.load_state_dict(torch.load("AI_Brain/weights/cnn_model.pt", map_location=device))
-        lstm.load_state_dict(torch.load("AI_Brain/weights/lstm_model.pt", map_location=device))
-        logger.info("✅ Loaded existing AI models.")
+    hparams = get_best_hyperparams()
+    hidden_size = hparams['hidden_size']
+    window_size = hparams['window_size']
+    dropout = hparams['dropout']
+    logger.info(f"✨ Initializing System with Optimized Hyperparameters: {hparams}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    explorer_model = HybridModel(input_size=27, hidden_size=hidden_size).to(device)
+    guardian_model = HybridModel(input_size=27, hidden_size=hidden_size).to(device)
+    
+    exp_path = "AI_Brain/weights/weights_explorer.pt"
+    guard_path = "AI_Brain/weights/weights_guardian.pt"
+    fallback_path = "AI_Brain/weights/best_hybrid_model.pt"
+    
+    if os.path.exists(exp_path):
+        explorer_model.load_state_dict(torch.load(exp_path, map_location=device))
+        logger.info("🚀 Explorer Brain Loaded.")
+    elif os.path.exists(fallback_path):
+        explorer_model.load_state_dict(torch.load(fallback_path, map_location=device))
+        logger.info("🚀 Explorer Brain Loaded (Fallback).")
         
-    decision_engine = DecisionEngine(cnn, lstm)
+    if os.path.exists(guard_path):
+        guardian_model.load_state_dict(torch.load(guard_path, map_location=device))
+        logger.info("🛡️ Guardian Brain Loaded.")
+    elif os.path.exists(fallback_path):
+        guardian_model.load_state_dict(torch.load(fallback_path, map_location=device))
+        logger.info("🛡️ Guardian Brain Loaded (Fallback).")
+
+    from AI_Brain.decision_engine import ConsensusEngine, ConfidenceCalibrator, RiskManager
+    calibrator = ConfidenceCalibrator(db)
+    await calibrator.update_stats()
+    
+    consensus_engine = ConsensusEngine(explorer_model, guardian_model, calibrator=calibrator)
     risk_manager = RiskManager(risk_per_trade=0.02)
     advisor = LLMRewardAdvisor(
         api_key_pool=srv_config["gemini_api_key_pool"],
         model_pool=srv_config.get("gemini_model_pool")
     ) if srv_config.get("llm_enabled") else None
     
-    mtf_managers = {} # Shared market data
-    active_workers = {} # user_id -> Task
+    mtf_managers = {}
+    active_workers = {} 
     
-    # --- Background Workers (Shared) ---
     async def command_worker():
         """Handles global Telegram commands."""
         while True:
@@ -459,37 +456,37 @@ async def run_trading_engine():
                 for cmd in cmds:
                     logger.info(f"📩 Telegram Command received: {cmd}")
                     if cmd == "/info":
-                        # Comprehensive System Information
                         users = await db.get_active_users()
                         total_trades = await db.count_total_trades()
                         open_trades = await db.count_open_trades()
                         closed_trades = await db.count_closed_trades()
                         
-                        # LLM Status
                         llm_status = "✅ ENABLED" if advisor else "❌ DISABLED"
                         llm_health = "🟢 HEALTHY" if advisor and advisor.is_healthy() else "🔴 UNHEALTHY"
                         
-                        # AI Mode
                         ai_mode = srv_config.get("ai_mode", "EXPLORER")
                         exploration_rate = srv_config.get("exploration_rate", 0.2)
                         
                         msg = f"""📊 **SYSTEM INFO**
 
-🔧 **Status**: {'ACTIVE' if state.get("trading_enabled", True) else 'PAUSED'}
-👥 **Users**: {len(users)} active
-⚙️ **Workers**: {len(active_workers)} running
+                                🔧 **Status**: {'ACTIVE' if state.get("trading_enabled", True) else 'PAUSED'}
+                                👥 **Users**: {len(users)} active
+                                ⚙️ **Workers**: {len(active_workers)} running
 
-📈 **Trade Statistics**
-├─ Total: {total_trades}
-├─ Open: {open_trades}
-└─ Closed: {closed_trades}
+                                📈 **Trade Statistics**
+                                ├─ Total: {total_trades}
+                                ├─ Open: {open_trades}
+                                └─ Closed: {closed_trades}
 
-🧠 **AI Intelligence**
-├─ Mode: {ai_mode}
-├─ Exploration: {exploration_rate * 100:.0f}%
-└─ LLM: {llm_status} {llm_health if advisor else ""}
+                                🧠 **AI Intelligence**
+                                ├─ Mode: {ai_mode} (Consensus Ensemble)
+                                ├─ Explorer: 🟢 ACTIVE
+                                ├─ Guardian: 🛡️ ACTIVE
+                                ├─ Exploration: {exploration_rate * 100:.0f}%
+                                └─ LLM: {llm_status} {llm_health if advisor else ""}
 
-💾 **Database**: {'🟢 CONNECTED' if await db.is_healthy() else '🔴 DISCONNECTED'}"""
+                                💾 **Database**: {'🟢 CONNECTED' if await db.is_healthy() else '🔴 DISCONNECTED'}
+                                """
                         
                         await notifier.send_message(msg)
                     
@@ -504,7 +501,6 @@ async def run_trading_engine():
                         logger.info("System DISABLED via Telegram.")
                         
                     elif cmd == "/history":
-                        # Show last 5 trades
                         trades = await db.get_rl_training_data(limit=5)
                         if not trades:
                             await notifier.send_message("📊 **History**: No recent trades found in database.")
@@ -526,7 +522,6 @@ async def run_trading_engine():
                 await notifier.send_message("🚨 **DATABASE ALERT**: Connection lost! RL data collection is paused.")
                 logger.error("Database health check failed.")
 
-    # Shared State for Background Tasks
     state = {
         "trading_enabled": True,
         "last_rl_order_count": 0,
@@ -535,47 +530,43 @@ async def run_trading_engine():
 
     async def retraining_worker():
         """Shared RL retraining logic."""
-        # Initialize last count on startup to avoid immediate retraining
-        # LOAD from DB Metadata if exists, else fallback to current count
         persistent_count = await db.get_metadata("last_retrain_trade_count")
         
         if persistent_count is not None:
             state["last_rl_order_count"] = int(persistent_count)
             logger.info(f"Retraining worker started. Loaded persistent count: {state['last_rl_order_count']}")
         else:
-            # FIX: If never retrained, set to 0 to trigger immediate training if trades exist
-            state["last_rl_order_count"] = 0
-            logger.info("Retraining worker started. No previous retrain found, initialized to 0.")
+            current_closed = await db.count_closed_trades()
+            state["last_rl_order_count"] = current_closed
+            await db.set_metadata("last_retrain_trade_count", str(current_closed))
+            logger.info(f"Retraining worker started. Baseline set to current closed trades: {current_closed}")
         
         while True:
-            await asyncio.sleep(600) # Check every 10 minutes
+            await asyncio.sleep(600)
             
             try:
                 current_closed = await db.count_closed_trades()
                 new_trades = current_closed - state["last_rl_order_count"]
                 
-                if new_trades >= 200:
+                if new_trades >= 30:
                     logger.info(f"🕒 RL Trigger: {new_trades} new trades detected. Starting RL retraining...")
                     await notifier.send_message(f"🧠 **RL Retraining Started**\n\nLearning from {new_trades} new trade results...")
                     
-                    # 1. Fetch Training Data from DB (Now pre-shaped by the background worker)
                     experiences = await db.get_rl_training_data(limit=500) 
                     
                     if experiences:
-                        # 2. Run RL Training (Advisor here is now used for any fallback shaping)
                         await train_rl_mode(experiences, advisor=advisor, db=db)
                         
-                        # 3. Reload weights and update state
-                        cnn.load_state_dict(torch.load("AI_Brain/weights/cnn_model.pt", map_location='cpu'))
-                        lstm.load_state_dict(torch.load("AI_Brain/weights/lstm_model.pt", map_location='cpu'))
+                        checkpoint = torch.load("AI_Brain/weights/hybrid_model.pt", map_location=device)
+                        explorer_model.load_state_dict(checkpoint)
+                        guardian_model.load_state_dict(checkpoint) 
+                        
                         state["last_rl_order_count"] = current_closed
                         
-                        # PERSIST the new count to DB
                         await db.set_metadata("last_retrain_trade_count", str(current_closed))
                         
                         logger.info("♻️ System updated with new RL weights and persistent count.")
                         
-                        # 4. Optional: Run backtest and notify
                         backtest_process = await asyncio.create_subprocess_exec(
                             "python", "-c",
                             "from AI_Brain.training_pipeline import run_backtest_only; run_backtest_only()",
@@ -600,11 +591,10 @@ async def run_trading_engine():
         """Shared LLM reward shaping logic."""
         logger.info("Reward shaping worker started.")
         while True:
-            await asyncio.sleep(300) # Every 5 minutes
+            await asyncio.sleep(300)
             if not advisor: continue
             
             try:
-                # 1. Fetch 5 unrated trades
                 unrated = await db.get_unrated_trades(limit=5)
                 if not unrated: continue
                 
@@ -612,25 +602,16 @@ async def run_trading_engine():
                 for exp in unrated:
                     score, reason = await advisor.get_quality_score(exp)
                     
-                    # Improved Reward Shaping Implementation
-                    # 50 is NEUTRAL. 100 is PERFECT. 0 is TRASH.
                     raw_reward = exp['reward']
                     
                     if raw_reward >= 0:
-                        # WIN: Boost reward if pattern was followed (Score > 50)
-                        # Reward = PnL * (Score / 50.0) -> Max 2x boost
                         adjusted_reward = raw_reward * (score / 50.0)
                     else:
-                        # LOSS: Penalize more if loss was due to poor discipline (Score < 50)
-                        # Formula: Reward = PnL * ((150 - Score) / 50.0)
-                        # If Score 100 (Good trade, bad luck): 150-100=50 / 50 = 1x (Original loss)
-                        # If Score 0 (Gambling): 150-0=150 / 50 = 3x (Triple penalty)
                         penalty_factor = (150 - score) / 50.0
                         adjusted_reward = raw_reward * penalty_factor
                     
-                    # Log to DB
                     await db.log_llm_reward(exp['id'], score, reason, adjusted_reward)
-                    await asyncio.sleep(2) # Safe RPM delay
+                    await asyncio.sleep(2)
                 
                 logger.info("LLM Batch: Reward shaping successful.")
             except Exception as e:
@@ -644,45 +625,21 @@ async def run_trading_engine():
         """
         logger.info("Position monitor worker started.")
         known_tickets = set()
-        retry_counts = {}  # Track retries for missing deal history
-        max_retries = 3    # Limit retries before skipping
+        retry_counts = {}
+        max_retries = 3
 
         while True:
             try:
-                await asyncio.sleep(15) # Check every 15s for missing deal history
+                await asyncio.sleep(15)
                 users = await db.get_active_users()
                 
                 for user in users:
                     user_id = user['id']
                     username = user['username']
                     
-                    # The original `known_tickets = set()` was inside the loop, which resets it every time.
-                    # Moving it outside or managing it differently is better, but for now,
-                    # the instruction adds it at the top level of the function.
-                    # The `if user_id not in known_tickets: known_tickets = set()` line is problematic
-                    # as `known_tickets` is a global set for the worker, not per user.
-                    # I will remove the problematic line and assume `known_tickets` is managed globally
-                    # or will be used differently. The instruction only adds `known_tickets = set()`
-                    # at the function scope, not inside the user loop.
-                    # This creates a conflict, but I must follow the instruction faithfully.
-                    # Given the instruction's diff, it seems the intent was to initialize it once.
-                    # I will remove the `if user_id not in known_tickets: known_tickets = set()` line
-                    # as it conflicts with the new global initialization and makes no sense with a single set.
-                    # The instruction implies `known_tickets` should be initialized once.
-
-                    # 1. Get DB Open Positions
                     db_positions = await db.get_open_positions(user_id)
                     if not db_positions: continue
                     
-                    # 2. Get MT5 Open Positions
-                    # We need to use the user's specific connection logic again?
-                    # Or simpler: Just check if the ticket exists in MT5.
-                    # Since MT5 context is global per process in this simple design, 
-                    # we must switch login if we want to be 100% sure, OR rely on the main loops.
-                    # BUT: main.py is single process, MT5 context is shared. 
-                    # We need to lock/switch context.
-                    
-                    # Robust approach: Loop users, login, check.
                     if not mt5.initialize(path=user['mt5_path']): continue
                     if not mt5.login(login=user['mt5_login'], password=user['mt5_password'], server=user['mt5_server']): continue
                     
@@ -690,28 +647,22 @@ async def run_trading_engine():
                     if mt5_positions is None: mt5_positions = []
                     mt5_tickets = [p.ticket for p in mt5_positions]
                     
-                    # 3. Detect Closed Positions (In DB but not in MT5)
                     for db_pos in db_positions:
                         ticket = db_pos['ticket']
                         
                         if ticket not in mt5_tickets:
                             logger.info(f"🔍 Detected closed position for ticket {ticket} ({db_pos['symbol']}) for user {username}. Syncing exit...")
                             
-                            # Check Retry Count
                             if retry_counts.get(ticket, 0) >= max_retries:
                                 logger.warning(f"⚠️ Max retries reached for ticket {ticket}. Skipping sync.")
                                 continue
-
-                            # Try to get deal history
                             history = mt5.history_deals_get(position=ticket)
                             
                             if history and len(history) > 0:
-                                # Found deal!
-                                exit_deal = history[-1] # Last deal is usually the exit
+                                exit_deal = history[-1]
                                 profit = exit_deal.profit
                                 exit_price = exit_deal.price
                                 exit_time = datetime.datetime.fromtimestamp(exit_deal.time)
-                                # Determine Closure Reason
                                 reason_code = exit_deal.reason
                                 closure_reason = "MANUAL"
                                 if reason_code == mt5.DEAL_REASON_TP:
@@ -726,12 +677,11 @@ async def run_trading_engine():
                                     ticket, 
                                     exit_price, 
                                     profit, 
-                                    profit, # net profit roughly same for now
+                                    profit, 
                                     reason=closure_reason
                                 )
                                 logger.info(f"✅ Synced exit for Ticket {ticket}: Profit {profit}, Price {exit_price}, Reason {closure_reason}")
                                 
-                                # Send Standardized Notification
                                 msg = (
                                     f"🎯 **Position Closed ({username})**\n\n"
                                     f"🎫 **Ticket**: {ticket}\n"
@@ -744,7 +694,6 @@ async def run_trading_engine():
                                 )
                                 await notifier.send_message(msg)
                                 
-                                # Reset retry count on success
                                 if ticket in retry_counts: del retry_counts[ticket]
                                 
                             else:
@@ -755,13 +704,11 @@ async def run_trading_engine():
                 logger.error(f"Position Monitor Error: {e}")
                 await asyncio.sleep(5)
 
-    # --- Market Poller ---
     async def shared_market_poller():
         """Aggregates ticks into candles for all symbols."""
         with open("Config/mt5_config.json", "r") as f: mt5_cfg = json.load(f)
         symbols = mt5_cfg.get('symbols', ["EURUSD"])
         
-        # Load MT5 Connection early for native execution
         config_path = "Config/mt5_config.json"
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
@@ -774,20 +721,41 @@ async def run_trading_engine():
             return
         
         logger.info(f"📊 Global Poller Started for symbols: {symbols}")
+        last_sentiment_fetch = 0
+        cached_sentiment = {s: 0.0 for s in symbols}
+
         while True:
             try:
+                current_time = time.time()
+                if current_time - last_sentiment_fetch > 300:
+                    for symbol in symbols:
+                        cached_sentiment[symbol] = await sentiment_analyzer.get_latest_market_sentiment(symbol)
+                    last_sentiment_fetch = current_time
+                    logger.info(f"📰 Sentiment Updated for all symbols: {cached_sentiment}")
+
                 for symbol in symbols:
                     tick = mt5.symbol_info_tick(symbol)
                     if not tick: continue
                     if symbol not in mtf_managers: mtf_managers[symbol] = MTFManager(timeframes=[60, 300, 3600], window_size=32)
                     mgr = mtf_managers[symbol]
-                    closed_tfs = mgr.add_tick({'symbol': symbol, 'bid': tick.bid, 'time': int(tick.time_msc)})
                     
-                    # Update Dashboard (M1, M5, H1 current candles)
+                    closed_tfs = mgr.add_tick({
+                        'symbol': symbol, 
+                        'bid': tick.bid, 
+                        'time': int(tick.time_msc),
+                        'sentiment': cached_sentiment.get(symbol, 0.0)
+                    })
+                    
                     for tf_sec, label in {60: 'M1', 300: 'M5', 3600: 'H1'}.items():
                         current_c = mgr.aggregators[tf_sec].get_current_candle()
                         if current_c:
-                            await post_to_dashboard({"type": "candle", "symbol": symbol, "timeframe": label, **current_c})
+                            await post_to_dashboard({
+                                "type": "candle", 
+                                "symbol": symbol, 
+                                "timeframe": label, 
+                                "sentiment": cached_sentiment.get(symbol, 0.0), 
+                                **current_c
+                            })
 
                     for tf_sec in closed_tfs:
                         label = {60: 'M1', 300: 'M5', 3600: 'H1'}.get(tf_sec)
@@ -795,26 +763,25 @@ async def run_trading_engine():
                             c = mgr.aggregators[tf_sec].get_last_closed_candle()
                             if c:
                                 await db.log_candle(symbol, label, c)
-                        # Phase 93A: Manage Trailing Stop on every M1 close
                         if tf_sec == 60:
-                            await manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10)
+                            await manage_trailing_stop(symbol, activation_pips=10, trailing_pips=10, db=db, mtf_managers=mtf_managers)
                 await asyncio.sleep(0.1)
             except Exception as e: logger.error(f"Poller error: {e}"); await asyncio.sleep(1)
 
-    # --- User Worker ---
     async def run_user_worker(user):
         """Dedicated worker for one user's trading lifecycle."""
         user_id, username, login, password, server, path = user['id'], user['username'], user['mt5_login'], user['mt5_password'], user['mt5_server'], user['mt5_path']
         logger.info(f"👤 Starting Worker for {username} (ID: {user_id})")
         
-        # Local state for this worker
+        symbols = srv_config.get('symbols', ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
+
         worker_state = {
             "trading_enabled": srv_config.get("trading_enabled", True),
             "ai_mode": srv_config.get("ai_mode", "EXPLORER"),
-            "pending_signals": {} # Phase 94: Signals waiting for Heartbeat (pulse)
+            "pending_signals": {},
+            "last_signal_candle": {s: None for s in symbols}
         }
         
-        # 1. Login to MT5 (Requires correct terminal path)
         if not mt5.initialize(path=path):
             logger.error(f"❌ Worker {username}: MT5 init failed at {path}")
             return
@@ -826,12 +793,9 @@ async def run_trading_engine():
 
         logger.info(f"✅ Worker {username}: Logged into {server}")
         
-        # Define symbols for this worker
-        symbols = srv_config.get('symbols', ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"])
         
         try:
             while True:
-                # Check for global trading pause
                 if not state.get("trading_enabled", True):
                     await asyncio.sleep(5)
                     continue
@@ -840,30 +804,25 @@ async def run_trading_engine():
                     mgr = mtf_managers.get(symbol)
                     if not mgr or not mgr.is_tf_ready(60): continue
                     
-                    # Phase 94: Handle Pending Signals (Heartbeat Confirmation)
                     pending_sig = worker_state["pending_signals"].get(symbol)
                     if pending_sig:
                         tick = mt5.symbol_info_tick(symbol)
                         if not tick: continue
                         
                         current_time = time.time()
-                        # 60s Timeout for Heartbeat
                         if current_time - pending_sig['time'] > 60:
                             logger.warning(f"💓 Heartbeat Timeout: {symbol} signal discarded (No-Pulse).")
                             del worker_state["pending_signals"][symbol]
                             continue
                         
-                        # Confirmation Logic: Move by at least 1 pip in predicted direction
-                        confirmed = False
-                        sym_info = mt5.symbol_info(symbol)
-                        pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * sym_info.point)
-                        if "XAU" in symbol.upper(): pip_size = 0.1
+                        atr = pending_sig.get('atr', 0.0001)
+                        confirmation_move = atr * 0.1
                         
                         if pending_sig['action'] == 'BUY':
-                            if tick.ask >= pending_sig['entry'] + (pip_size * 0.5): # confirmed by tiny move
+                            if tick.ask >= pending_sig['entry'] + confirmation_move:
                                 confirmed = True
                         else:
-                            if tick.bid <= pending_sig['entry'] - (pip_size * 0.5):
+                            if tick.bid <= pending_sig['entry'] - confirmation_move:
                                 confirmed = True
                                 
                         if confirmed:
@@ -874,73 +833,104 @@ async def run_trading_engine():
                                 notifier=notifier, signal_data=pending_sig['signal_data'], db=db
                             )
                             del worker_state["pending_signals"][symbol]
-                        continue # Skip AI analysis if we have a pending signal
+                        continue
 
-                    # 1. Market Open Check
                     is_open, _ = is_market_open(symbol)
                     if not is_open: continue
                     
-                    # Phase 94: Limit Concurrent Trades (Max 5 per symbol)
-                    MAX_CONCURRENT = srv_config.get("max_concurrent_trades_per_symbol", 8)
-                    positions = mt5.positions_get(symbol=symbol)
-                    if positions and len([p for p in positions if p.magic == 123456]) >= MAX_CONCURRENT:
-                        # logger.debug(f"🚫 Trade Limit Reached for {symbol}: {len(positions)} open positions. Skipping analysis.")
+                    current_candle = mgr.aggregators[60].get_current_candle()
+                    if current_candle and worker_state["last_signal_candle"].get(symbol) == current_candle['time']:
                         continue
 
-                    # 2. MTF Analysis (Shared Model)
-                    mtf_inputs = {}
-                    for tf in [60, 300, 3600]:
-                        if mgr.is_tf_ready(tf):
-                            df = mgr.get_data_for_tf(tf)
-                            gaf_img = gaf_transformer.transform(df['close'].values.astype(float))
-                            features = df[['open', 'high', 'low', 'close', 'tick_volume']].values.astype(float)
-                            min_v, max_v = features.min(axis=0), features.max(axis=0)
+                    MAX_CONCURRENT = srv_config.get("max_concurrent_trades_per_symbol", 5)
+                    positions = mt5.positions_get(symbol=symbol)
+                    if positions and len([p for p in positions if p.magic == 123456]) >= MAX_CONCURRENT:
+                        continue
+
+                    # MTF Synchronization for 27-feature Model
+                    if mgr.is_tf_ready(60) and mgr.is_tf_ready(300) and mgr.is_tf_ready(3600):
+                        df_m1 = mgr.get_data_for_tf(60)
+                        df_m5 = mgr.get_data_for_tf(300)
+                        df_h1 = mgr.get_data_for_tf(3600)
+                        
+                        # Use M1 as anchor, Left Join M5 and H1
+                        # Note: In live mode, we only need the VERY LAST row for prediction
+                        last_m1 = df_m1.iloc[-32:] # We need window_size=32
+                        
+                        # Simple sync for live: just take the last 32 of each and align
+                        # (In live, they should already be roughly aligned by the manager)
+                        
+                        def normalize_df(df):
+                            feat_cols = ['open', 'high', 'low', 'close', 'tick_volume', 'rsi', 'macd_sig', 'macd_hist', 'sentiment']
+                            # Ensure columns exist
+                            for c in feat_cols:
+                                if c not in df.columns: df[c] = 0.0
+                            feats = df[feat_cols].tail(32).values.astype(float)
+                            min_v = feats.min(axis=0)
+                            max_v = feats.max(axis=0)
                             rng = (max_v - min_v)
                             rng[rng==0] = 1.0
-                            norm_feat = (features - min_v) / rng
-                            
-                            mtf_inputs[tf] = (
-                                torch.tensor(gaf_img, dtype=torch.float32).unsqueeze(0).unsqueeze(0),
-                                torch.tensor(norm_feat, dtype=torch.float32).unsqueeze(0)
-                            )
+                            return (feats - min_v) / rng
 
-                    signal = decision_engine.analyze_mtf(
-                        mtf_inputs, 
-                        ai_mode=worker_state["ai_mode"], 
+                        seq_m1 = normalize_df(df_m1)
+                        seq_m5 = normalize_df(df_m5)
+                        seq_h1 = normalize_df(df_h1)
+                        
+                        # Concatenate into 27 features
+                        sync_seq = np.concatenate([seq_m1, seq_m5, seq_h1], axis=1) # [32, 27]
+                        
+                        gaf_img = gaf_transformer.transform(df_m1['close'].tail(32).values.astype(float))
+                        
+                        mtf_input_sync = (
+                            torch.tensor(gaf_img, dtype=torch.float32).to(device).unsqueeze(0).unsqueeze(0),
+                            torch.tensor(sync_seq, dtype=torch.float32).to(device).unsqueeze(0)
+                        )
+                    else:
+                        continue # Wait for all TFs to be ready
+
+                    signal = consensus_engine.analyze_mtf_consensus(
+                        mtf_input_sync, 
+                        exploration_rate=srv_config.get("exploration_rate", 0.0), 
                         symbol=symbol
                     )
                     
-                    # Phase 93B: Profit Target Check
-                    PROFIT_TARGET_PIPS = srv_config.get("profit_target_pips", 15)
                     if positions:
-                        sym_info_pt = mt5.symbol_info(symbol)
-                        pt_point = sym_info_pt.point if sym_info_pt else 0.00001
-                        pt_pip_size = 0.01 if "JPY" in symbol.upper() else (10.0 * pt_point)
+                        m1_data_pt = mgr.get_data_for_tf(60)
+                        current_atr_pt = m1_data_pt['atr'].iloc[-1] if not m1_data_pt.empty and 'atr' in m1_data_pt.columns else 0.0002
+                        pip_size_pt = get_pip_size(symbol)
+                        min_tp_pips = 10
+                        dynamic_target_pips = max(min_tp_pips, (current_atr_pt * 2.0) / pip_size_pt)
+                        
                         for p in positions:
                             if p.magic != 123456: continue
                             tick_pt = mt5.symbol_info_tick(symbol)
                             if not tick_pt: continue
                             if p.type == mt5.POSITION_TYPE_BUY:
-                                profit_pips = (tick_pt.bid - p.price_open) / pt_pip_size
+                                profit_pips = (tick_pt.bid - p.price_open) / pip_size_pt
                             else:
-                                profit_pips = (p.price_open - tick_pt.ask) / pt_pip_size
+                                profit_pips = (p.price_open - tick_pt.ask) / pip_size_pt
                             
-                            if profit_pips >= PROFIT_TARGET_PIPS:
-                                logger.info(f"🎯 Profit Target Hit: {symbol} Ticket {p.ticket} | +{profit_pips:.1f} pips. Closing.")
+                            if profit_pips >= dynamic_target_pips:
+                                logger.info(f"🎯 Dynamic Target Hit: {symbol} Ticket {p.ticket} | +{profit_pips:.1f} pips (Target: {dynamic_target_pips:.1f}). Closing.")
                                 trade_exe_logger.info(f"CLOSE_PROFIT_TARGET: {symbol} | Ticket: {p.ticket} | Pips: +{profit_pips:.1f}")
+                                await close_all_positions(user_id, symbol, action_type=p.type, notifier=notifier, db=db)
+                                
+                    if positions and signal.get('is_exhausted'):
+                        for p in positions:
+                            if p.magic != 123456: continue
+                            if (p.type == mt5.POSITION_TYPE_BUY and signal['action'] == 'BUY') or \
+                               (p.type == mt5.POSITION_TYPE_SELL and signal['action'] == 'SELL'):
+                                logger.info(f"🛑 AI Exhaustion Exit: {symbol} Ticket {p.ticket}. Reason: {signal['exhaustion_reason']}")
+                                trade_exe_logger.info(f"CLOSE_EXHAUSTION: {symbol} | Ticket: {p.ticket} | Reason: {signal['exhaustion_reason']}")
                                 await close_all_positions(user_id, symbol, action_type=p.type, notifier=notifier, db=db)
                     
                     if signal['action'] != 'HOLD':
-                        # 3. Execution (User-Specific)
                         trade_logger.info(f"SIGNAL: {username} | {symbol} {signal['action']} (Confidence: {signal['confidence']:.2f})")
                         logger.info(f"🚀 Worker {username}: Signal {symbol} {signal['action']}")
                         
                         account = mt5.account_info()
                         current_equity = account.equity if account else 1000.0
                         
-                        # Phase 94.5: Profit-Harvest Reversal Logic
-                        # If the new signal contradicts existing positions and those positions are net profitable, 
-                        # we flush them all to harvest profit before entering the new direction.
                         current_positions = [p for p in positions if p.magic == 123456]
                         if current_positions:
                             opp_type = mt5.POSITION_TYPE_SELL if signal['action'] == 'BUY' else mt5.POSITION_TYPE_BUY
@@ -948,14 +938,14 @@ async def run_trading_engine():
                             
                             if opposite_positions:
                                 total_opp_profit = sum(p.profit for p in opposite_positions)
-                                if total_opp_profit > 0:
-                                    logger.info(f"🔄 Profit-Harvest Reversal: {symbol} has {len(opposite_positions)} opposite positions with Net Profit ${total_opp_profit:.2f}. Flushing all.")
-                                    # Close ALL positions for this symbol to start fresh
+                                if total_opp_profit > 0 and signal['confidence'] >= 0.75:
+                                    logger.info(f"🔄 Strategic Profit-Harvest: {symbol} Net Profit ${total_opp_profit:.2f} + Strong Signal ({signal['confidence']:.2f}). Flushing.")
                                     await close_all_positions(user_id, symbol, notifier=notifier, db=db)
-                                    # Update positions list for subsequent logic
                                     positions = mt5.positions_get(symbol=symbol) or []
                         
-                        # Risk Calculation
+                        m1_data = mgr.get_data_for_tf(60)
+                        current_atr = m1_data['atr'].iloc[-1] if not m1_data.empty and 'atr' in m1_data.columns else 0.0002
+                        
                         tick = mt5.symbol_info_tick(symbol)
                         entry_price = tick.ask if signal['action'] == 'BUY' else tick.bid
                         
@@ -964,67 +954,62 @@ async def run_trading_engine():
                         tick_size = symbol_info.trade_tick_size
                         tick_value = symbol_info.trade_tick_value
                         
-                        pip_price_offset = 0.01 if "JPY" in symbol.upper() else (10.0 * point)
-                        if "XAU" in symbol.upper(): pip_price_offset = 0.1
-                        dollar_value_per_pip = (pip_price_offset / tick_size) * tick_value
-                        
-                        risk_lots = risk_manager.calculate_lot_size(
-                            current_equity, 20, confidence=signal['confidence'], 
-                            pip_value=dollar_value_per_pip, commission_per_lot=srv_config.get("commission_per_lot", 7.0)
+                        sl, tp = risk_manager.calculate_sl_tp(
+                            symbol, signal['action'], entry_price, 
+                            atr=current_atr, point=point, tick_size=tick_size,
+                            digits=symbol_info.digits,
+                            confidence=signal['confidence']
                         )
+                        
+                        sl_price_distance = abs(entry_price - sl)
+                        
+                        lot_size = risk_manager.calculate_lot_size(
+                            current_equity, sl_price_distance, confidence=signal['confidence'], 
+                            tick_value=tick_value, tick_size=tick_size
+                        )
+                        
                         account_info = mt5.account_info()
                         free_margin = account_info.margin_free if account_info else 0.0
                         affordable_lots = risk_manager.calculate_max_affordable_lots(symbol, signal['action'], free_margin, mt5_module=mt5)
-                        lot_size = min(risk_lots, affordable_lots)
+                        lot_size = min(lot_size, affordable_lots)
                         
                         if lot_size < symbol_info.volume_min:
                             logger.warning(f"⚠️ {username}: Final lot size {lot_size} is below minimum {symbol_info.volume_min}. Skipping trade.")
                             continue
-
-                        sl, tp = risk_manager.calculate_sl_tp(
-                            symbol, signal['action'], entry_price, 
-                            stop_loss_pips=20, point=point, tick_size=symbol_info.trade_tick_size,
-                            confidence=signal['confidence']
-                        )
                         
-                        # Phase 94: Store as Pending Signal (Wait for Heartbeat)
                         worker_state["pending_signals"][symbol] = {
                             "action": signal['action'],
                             "entry": entry_price,
                             "lots": lot_size,
                             "sl": sl,
                             "tp": tp,
+                            "atr": current_atr,
                             "time": time.time(),
                             "signal_data": signal
                         }
+                        worker_state["last_signal_candle"][symbol] = current_candle['time']
                         logger.info(f"💓 Heartbeat Pending: {symbol} {signal['action']} @ {entry_price}... waiting for confirmation.")
                 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(2.0)
         except Exception as e:
             logger.error(f"Main Loop Error: {e}\n{traceback.format_exc()}")
             await asyncio.sleep(5)
 
-    # --- Main Event Loop ---
-    # 1. Sync Historical Data
-    logger.info("🔄 Syncing historical data from MT5...")
-    m1_history = await sync_historical_data(mtf_managers, db)
+    logger.info("🔄 Syncing historical data from Local Database...")
+    m1_history = await sync_historical_data(mtf_managers, db, window_size=window_size)
     
-    # 2. Push to Dashboard in a SINGLE BATCH
     if m1_history:
         logger.info(f"📤 Pushing {len(m1_history)} historical candles to Dashboard (Batch)...")
         await post_to_dashboard(m1_history)
     
-    # Send Startup Notification to Telegram
     await notifier.send_message(
         "🚀 **QuantSystem Started**\n\nOperation Mode: {}\nSystem is ready and monitoring.".format(srv_config.get("ai_mode", "EXPLORER")),
         reply_markup=notifier.get_main_menu()
     )
     
-    # 3. Get Active Users
     users = await db.get_active_users()
     logger.info(f"👥 Found {len(users)} active users in database")
     
-    # 4. Start Background Workers
     background_tasks = [
         asyncio.create_task(command_worker()),
         asyncio.create_task(db_monitor_worker()),
@@ -1034,7 +1019,6 @@ async def run_trading_engine():
         asyncio.create_task(shared_market_poller())
     ]
     
-    # 5. Start User Workers
     for user in users:
         task = asyncio.create_task(run_user_worker(user))
         active_workers[user['id']] = task
@@ -1042,7 +1026,6 @@ async def run_trading_engine():
     
     logger.info(f"✅ System fully initialized. Running {len(background_tasks)} workers.")
     
-    # 6. Run Forever
     try:
         await asyncio.gather(*background_tasks)
     except Exception as e:

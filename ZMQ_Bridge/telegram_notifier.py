@@ -19,7 +19,7 @@ class TelegramNotifier:
                 else:
                     logger.warning("Telegram Bot Token not configured properly. Alerts disabled.")
             
-            self.offset = 0  # Track last update processed
+            self.offset = 0
         except Exception as e:
             logger.error(f"Failed to load Telegram config: {e}")
 
@@ -53,7 +53,6 @@ class TelegramNotifier:
             logger.error(f"Failed to send Telegram message: {e}")
 
     def get_main_menu(self):
-        """Returns standard keyboard buttons for the bot control."""
         return {
             "keyboard": [
                 [{"text": "/info"}, {"text": "/history"}],
@@ -64,7 +63,6 @@ class TelegramNotifier:
         }
 
     async def check_commands(self):
-        """Polls for new commands from Telegram."""
         if not self.enabled: return []
         
         try:
@@ -88,7 +86,6 @@ class TelegramNotifier:
                             
                             logger.info(f"📨 Update received: from_id={from_id}, chat_id={chat_id_msg}, expected={expected_chat_id}, text='{text}'")
                             
-                            # Match on EITHER from.id OR chat.id to handle both private and group chats
                             if (from_id == expected_chat_id or chat_id_msg == expected_chat_id) and text:
                                 new_cmds.append(text.lower().strip())
                                 logger.info(f"✅ Command accepted: {text}")
@@ -96,7 +93,7 @@ class TelegramNotifier:
                                 logger.warning(f"⚠️ Command rejected: from_id={from_id}, chat_id={chat_id_msg} != expected={expected_chat_id}")
                     return new_cmds
         except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError):
-            pass # Transient network issues are common and harmless
+            pass
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 409:
                 logger.error("Telegram Conflict (409): Another instance is likely running. Close other terminal windows.")

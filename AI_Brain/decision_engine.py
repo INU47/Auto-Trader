@@ -5,34 +5,65 @@ import math
 
 logger = logging.getLogger("DecisionEngine")
 
+class ConfidenceCalibrator:
+    def __init__(self, db_handler):
+        self.db = db_handler
+        self.stats = {}
+
+    async def update_stats(self):
+        if not self.db: return
+        try:
+            trades = await self.db.get_rl_training_data(limit=500)
+            if not trades: return
+            
+            brackets = {}
+            for t in trades:
+                conf = t.get('cnn_confidence', 0.0)
+                bracket = round(math.floor(conf * 10) / 10.0, 1)
+                if bracket not in brackets: brackets[bracket] = []
+                brackets[bracket].append(1 if t['reward'] > 0 else 0)
+                
+            for b, results in brackets.items():
+                self.stats[b] = sum(results) / len(results)
+                
+            logger.info(f"📊 Confidence Stats Updated: {self.stats}")
+        except Exception as e:
+            logger.error(f"Calibration update failed: {e}")
+
+    def get_calibration_factor(self, confidence):
+        bracket = round(math.floor(confidence * 10) / 10.0, 1)
+        win_rate = self.stats.get(bracket, 0.5)
+        
+        if win_rate < 0.45:
+            return 0.7
+        if win_rate > 0.60:
+            return 1.2
+        return 1.0
+
 class DecisionEngine:
-    def __init__(self, cnn_model, lstm_model, atr_period=14):
-        self.cnn = cnn_model
-        self.lstm = lstm_model
-        self.cnn.eval() # Set to inference mode
-        self.lstm.eval()
+    def __init__(self, model, calibrator=None, atr_period=14):
+        self.model = model
+        self.model.eval()
+        self.calibrator = calibrator
         self.atr_period = atr_period
 
     def analyze(self, gaf_image, raw_series):
-        """Standard single-TF analyze (Legacy/Compatibility)"""
         with torch.no_grad():
-            cnn_logits = self.cnn(gaf_image)
-            cnn_probs = torch.softmax(cnn_logits, dim=1)
-            cnn_conf, cnn_class = torch.max(cnn_probs, 1)
-            lstm_pred = self.lstm(raw_series)
+            logits, trend, attn = self.model(gaf_image, raw_series)
+            probs = torch.softmax(logits, dim=1)
+            conf, pred_class = torch.max(probs, 1)
             
             return {
-                'class': cnn_class.item(),
-                'conf': cnn_conf.item(),
-                'trend': lstm_pred.item()
+                'class': pred_class.item(),
+                'conf': conf.item(),
+                'trend': trend.item(),
+                'attn_weights': attn
             }
 
-    def analyze_mtf(self, mtf_data, ai_mode="CONSERVATIVE", exploration_rate=0.0, symbol="Unknown"):
+    def analyze_mtf(self, mtf_sync_data, ai_mode="CONSERVATIVE", exploration_rate=0.0, symbol="Unknown"):
         """
-        mtf_data: { timeframe: (gaf_tensor, lstm_tensor) }
-        Confluence Logic: 
-        - CONSERVATIVE: Entry on M1 IF confirmed by M5 AND H1.
-        - EXPLORER: Entry on M1 IF confirmed by M5 OR H1.
+        New MTF analysis logic for the 27-feature model.
+        mtf_sync_data: (gaf_image, seq_27_features)
         """
         pattern_names = {
             0: "Neutral / Consolidation",
@@ -47,104 +78,117 @@ class DecisionEngine:
             9: "Doji - Indecision / Pivot Point"
         }
         
-        results = {}
-        for tf, (gaf, seq) in mtf_data.items():
-            results[tf] = self.analyze(gaf, seq)
-
-        m1 = results.get(60)
-        m5 = results.get(300)
-        h1 = results.get(3600)
-
+        gaf, seq = mtf_sync_data
+        res = self.analyze(gaf, seq)
+        
+        # M1 features are index 0-8. RSI is 5, Sentiment is 8.
+        rsi = seq[0, -1, 5].item() 
+        sent = seq[0, -1, 8].item()
+        m5_trend_est = seq[0, -1, 12].item() # Example: m5_close or similar (not exact but for logging)
+        
         signal = {'action': 'HOLD', 'confidence': 0.0, 'report': ''}
         
-        # RL Exploration Logic (Priority 1: Experience gathering)
-        if m1 and np.random.random() < exploration_rate:
+        # RL Exploration
+        if np.random.random() < exploration_rate:
             action = 'BUY' if np.random.random() > 0.5 else 'SELL'
             logger.info(f"🎲 RL Exploration Triggered: {action}")
-            
-            # Retrieve model inferences for logging (even if action is random)
-            pattern_text = pattern_names.get(m1['class'], "Unknown")
-            is_uptrend = m1['trend'] > 0
-            future_outlook = "ขาขึ้นแข็งแกร่ง" if is_uptrend else "แนวโน้มขาลง"
-            
-            # Calculate Synthetic LSTM Confidence
-            # Assumption: Trend is now scaled to Points (e.g. 10.0 = 1 Pip)
-            # We treat > 50 points (5 pips) as "High Confidence" (1.0)
-            trend_val = m1['trend']
-            lstm_conf = min(abs(trend_val) / 50.0, 1.0)
-            
-            analyst_data = {
-                'pattern': pattern_text,
-                'future_outlook': future_outlook,
-                'is_uptrend': is_uptrend,
-                'confidence': m1['conf']
-            }
-            
+            pattern_text = pattern_names.get(res['class'], "Unknown")
             return {
-                'action': action, 
-                'confidence': 0.5, 
-                'reason': 'RL Exploration',
-                'report': f"🔍 **Exploration Mode**: ลองทดสอบคำสั่ง {action} เพื่อเรียนรู้ตลาด (Exploration Rate: {exploration_rate})",
-                'analyst_metadata': analyst_data,
-                'raw_cnn_class': m1['class'],  # Pass to DB
-                'raw_lstm_trend': m1['trend'],
-                'raw_lstm_conf': lstm_conf, # Now using calculated confidence
-                'ai_mode': ai_mode
+                'action': action, 'confidence': 0.5, 'reason': 'RL Exploration',
+                'report': f"🔍 **Exploration Mode**: ลองทดสอบคำสั่ง {action} (Exploration Rate: {exploration_rate})",
+                'analyst_metadata': {'pattern': pattern_text, 'confidence': res['conf']},
+                'raw_cnn_class': res['class'], 'raw_lstm_trend': res['trend'], 'ai_mode': ai_mode
             }
 
-        if m1:
-            # 2. Confluence Logic & Weighted Confidence (Phase 96)
-            # Weights: M1=0.5, M5=0.3, H1=0.2
-            is_bullish = m1['class'] in [1, 3, 5, 7] and m1['trend'] > 0
-            is_bearish = m1['class'] in [2, 4, 6, 8] and m1['trend'] < 0
-            
-            # Calculate Base Weighted Confidence
-            conf_score = m1['conf'] * 0.5
-            if m5:
-                # Add M5 weight if it agrees with M1 trend, else penalize
-                weight = 0.3
-                if (is_bullish and m5['trend'] > 0) or (is_bearish and m5['trend'] < 0):
-                    conf_score += m5['conf'] * weight
-                else:
-                    conf_score -= m5['conf'] * weight # Penalty for contradiction
-            
-            if h1:
-                weight = 0.2
-                if (is_bullish and h1['trend'] > 0) or (is_bearish and h1['trend'] < 0):
-                    conf_score += h1['conf'] * weight
-                else:
-                    conf_score -= h1['conf'] * weight
-            
-            # Clamp final confidence [0, 1]
-            final_conf = max(0.0, min(1.0, conf_score))
+        # Strategy Logic
+        is_bullish = res['class'] in [1, 3, 5, 7] and res['trend'] > 0
+        is_bearish = res['class'] in [2, 4, 6, 8] and res['trend'] < 0
+        
+        # Exhaustion Filters
+        is_exhausted = False
+        exhaustion_reason = ""
+        if (is_bullish and rsi > 0.85) or (is_bearish and rsi < 0.15):
+            is_exhausted = True
+            exhaustion_reason = f"Extreme RSI Exhaustion ({rsi:.2f})"
+        elif res['class'] == 9:
+            is_exhausted = True
+            exhaustion_reason = "Doji Indecision"
+        
+        final_conf = res['conf']
+        min_conf = 0.6 if ai_mode == "CONSERVATIVE" else 0.5
+        
+        # Apply Filters directly to confidence
+        if is_bullish and (rsi > 0.75 or sent < -0.3): final_conf *= 0.7
+        if is_bearish and (rsi < 0.25 or sent > 0.3): final_conf *= 0.7
 
-            if ai_mode == "EXPLORER":
-                bull_confirmed = True if not (m5 or h1) else ((m5['trend'] > 0 if m5 else False) or (h1['trend'] > 0 if h1 else False))
-                bear_confirmed = True if not (m5 or h1) else ((m5['trend'] < 0 if m5 else False) or (h1['trend'] < 0 if h1 else False))
-                min_conf = 0.5 # Relaxed because weighted score is harder to keep high
-            else:
-                if not (m5 and h1): return signal
-                bull_confirmed = (m5['trend'] > 0 and h1['trend'] > 0)
-                bear_confirmed = (m5['trend'] < 0 and h1['trend'] < 0)
-                min_conf = 0.6
+        if self.calibrator:
+            final_conf *= self.calibrator.get_calibration_factor(final_conf)
 
-            # Generate Report Components
+        pattern_text = pattern_names.get(res['class'], "Unknown")
+        analyst_data = {
+            'pattern': pattern_text, 'confidence': final_conf,
+            'rsi': rsi, 'sent': sent, 'trend': res['trend']
+        }
+
+        if is_bullish and final_conf >= min_conf:
+            signal = {
+                'action': 'BUY', 'confidence': final_conf, 
+                'reason': f'MTF Bullish {ai_mode}', 'analyst_metadata': analyst_data,
+                'raw_cnn_class': res['class'], 'raw_lstm_trend': res['trend'],
+                'ai_mode': ai_mode, 'is_exhausted': is_exhausted, 'exhaustion_reason': exhaustion_reason
+            }
+        elif is_bearish and final_conf >= min_conf:
+            signal = {
+                'action': 'SELL', 'confidence': final_conf, 
+                'reason': f'MTF Bearish {ai_mode}', 'analyst_metadata': analyst_data,
+                'raw_cnn_class': res['class'], 'raw_lstm_trend': res['trend'],
+                'ai_mode': ai_mode, 'is_exhausted': is_exhausted, 'exhaustion_reason': exhaustion_reason
+            }
+            
+        return signal
+
             pattern_text = pattern_names.get(m1['class'], "Unknown")
             is_uptrend = m1['trend'] > 0
             future_outlook = "ขาขึ้นแข็งแกร่ง" if is_uptrend else "แนวโน้มขาลง"
 
-            # Metadata for Analyst
             analyst_data = {
                 'pattern': pattern_text,
                 'future_outlook': future_outlook,
                 'is_uptrend': is_uptrend,
-                'confidence': final_conf, # Using weighted
+                'confidence': final_conf,
                 'm1_conf': m1['conf'],
+                'm1_rsi': m1.get('rsi', 0.5),
+                'm1_sentiment': m1.get('sentiment', 0.0),
                 'm5_trend': m5['trend'] if m5 else 0,
                 'h1_trend': h1['trend'] if h1 else 0
             }
             
-            # Helper for LSTM Confidence
+            rsi = m1.get('rsi', 0.5) 
+            sent = m1.get('sentiment', 0.0)
+            
+            if is_bullish:
+                if rsi > 0.75:
+                    final_conf *= 0.7
+                    logger.info(f"🛡️ RSI Bull Filter: {symbol} RSI {rsi:.2f} is Overbought. Reducing confidence.")
+                if sent < -0.4:
+                    final_conf *= 0.5
+                    logger.info(f"🛡️ Sentiment Bull Filter: {symbol} Sentiment {sent:.2f} is Negative. Reducing confidence.")
+            
+            elif is_bearish:
+                if rsi < 0.25:
+                    final_conf *= 0.7
+                    logger.info(f"🛡️ RSI Bear Filter: {symbol} RSI {rsi:.2f} is Oversold. Reducing confidence.")
+                if sent > 0.4:
+                    final_conf *= 0.5
+                    logger.info(f"🛡️ Sentiment Bear Filter: {symbol} Sentiment {sent:.2f} is Positive. Reducing confidence.")
+
+            if self.calibrator:
+                c_factor = self.calibrator.get_calibration_factor(final_conf)
+                if c_factor != 1.0:
+                    old_conf = final_conf
+                    final_conf *= c_factor
+                    logger.info(f"⚖️ Confidence Calibrated: {symbol} {old_conf:.2f} -> {final_conf:.2f} (Factor: {c_factor})")
+
             trend_val = m1['trend']
             lstm_conf = min(abs(trend_val) / 50.0, 1.0)
 
@@ -157,7 +201,9 @@ class DecisionEngine:
                     'raw_cnn_class': m1['class'],  
                     'raw_lstm_trend': m1['trend'],
                     'raw_lstm_conf': lstm_conf,
-                    'ai_mode': ai_mode
+                    'ai_mode': ai_mode,
+                    'is_exhausted': is_exhausted,
+                    'exhaustion_reason': exhaustion_reason
                 }
             elif is_bearish and bear_confirmed and final_conf >= min_conf:
                 signal = {
@@ -168,32 +214,26 @@ class DecisionEngine:
                     'raw_cnn_class': m1['class'],  
                     'raw_lstm_trend': m1['trend'],
                     'raw_lstm_conf': lstm_conf,
-                    'ai_mode': ai_mode
+                    'ai_mode': ai_mode,
+                    'is_exhausted': is_exhausted,
+                    'exhaustion_reason': exhaustion_reason
                 }
             else:
-                # Capture pattern detections even if no trade action is taken
                 if final_conf < min_conf:
                     logger.info(f"⚠️ Signal Skipped: {symbol} Pattern {pattern_text} | W-Conf {final_conf:.2f} < {min_conf}")
                 signal['analyst_metadata'] = analyst_data
                 signal['raw_cnn_class'] = m1['class']
                 signal['raw_lstm_trend'] = m1['trend']
                 signal['raw_lstm_conf'] = lstm_conf
+                signal['is_exhausted'] = is_exhausted
+                signal['exhaustion_reason'] = exhaustion_reason
                 
         return signal
 
     def extract_rl_features(self, gaf_image, raw_series):
-        """
-        Exposes latent features for Reinforcement Learning.
-        Returns a flat numpy array (State Vector).
-        """
         with torch.no_grad():
-            # Get CNN Features (before final linear layer)
-            # PatternCNN.forward has x = self.fc2(x), let's assume we want fc1 or similar
-            # Since models.py is simple, we'll just take the logits + trend as a basic state for now
             cnn_logits = self.cnn(gaf_image)
             lstm_pred = self.lstm(raw_series)
-            
-            # Combine into a vector
             state = torch.cat([cnn_logits.flatten(), lstm_pred.flatten()])
             return state.cpu().numpy()
 
@@ -201,26 +241,26 @@ class RiskManager:
     def __init__(self, risk_per_trade=0.01):
         self.risk_per_trade = risk_per_trade 
 
-    def calculate_sl_tp(self, symbol, action, entry_price, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001, commission_buffer_pips=2.0, confidence=None):
-        """Calculates precise price levels for SL and TP based on pips and tick_size.
-        
-        If confidence is provided, the reward_ratio is computed dynamically:
-          - confidence 0.55 → RR 1.0 (TP = SL distance)
-          - confidence 0.70 → RR 1.5
-          - confidence 0.85+ → RR 2.0
-        """
-        # Phase 87: Handle JPY pairs (usually 3 decimal places, pip is 0.01)
-        is_jpy = "JPY" in symbol.upper()
-        pip_value = 0.01 if is_jpy else (10 * point)
-        
-        # Phase 93C: Dynamic RR based on AI confidence
+    def calculate_sl_tp(self, symbol, action, entry_price, atr=None, stop_loss_pips=20, reward_ratio=2.0, point=0.00001, tick_size=0.00001, digits=5, commission_buffer_pips=2.0, confidence=None):
+        s_upper = symbol.upper()
+        if "XAU" in s_upper or "GOLD" in s_upper:
+            pip_value = 0.1
+        elif "JPY" in s_upper or digits in [2, 3]:
+            pip_value = 0.01
+        elif digits in [0, 1]:
+            pip_value = 1.0
+        else:
+            pip_value = 10 * point
+            
+        if atr is not None and atr > 0:
+            sl_offset = atr * 1.5
+        else:
+            sl_offset = stop_loss_pips * pip_value
+            
         if confidence is not None:
-            # Clamp confidence to [0.55, 0.85] and map to RR [1.0, 2.0]
             conf_clamped = max(0.55, min(0.85, confidence))
             reward_ratio = 1.0 + ((conf_clamped - 0.55) / 0.30) * 1.0
         
-        sl_offset = stop_loss_pips * pip_value
-        # TP includes the buffer to ensure net profit after commission
         tp_offset = (sl_offset * reward_ratio) + (commission_buffer_pips * pip_value)
         
         if action.upper() == "BUY":
@@ -230,57 +270,95 @@ class RiskManager:
             sl = entry_price + sl_offset
             tp = entry_price - tp_offset
             
-        # Standardize rounding to the broker's tick_size
         def normalize(price):
             return round(price / tick_size) * tick_size
             
         return normalize(sl), normalize(tp)
 
-    def calculate_lot_size(self, account_equity, stop_loss_pips, confidence=0.5, pip_value=0.0001, commission_per_lot=7.0):
-        if stop_loss_pips <= 0: return 0.01
+    def calculate_lot_size(self, account_equity, sl_price_distance, confidence=0.5, tick_value=1.0, tick_size=0.00001):
+        if sl_price_distance <= 0: return 0.01
         
-        # Dynamic Risk Scaling
+        risk_amount = account_equity * self.risk_per_trade
+        
         confidence_factor = max(0.5, min(1.5, confidence / 0.7)) 
-        adjusted_risk = self.risk_per_trade * confidence_factor
+        risk_amount *= confidence_factor
         
-        risk_amount = account_equity * adjusted_risk
+        ticks_at_risk = sl_price_distance / tick_size
+        dollar_risk_per_lot = ticks_at_risk * tick_value
         
-        # Lot Calculation with Commission Compensation
-        denominator = (stop_loss_pips * pip_value) + commission_per_lot
-        raw_lots = risk_amount / denominator if denominator > 0 else 0.01
+        if dollar_risk_per_lot <= 0: return 0.01
+        
+        raw_lots = risk_amount / dollar_risk_per_lot
         
         return round(max(0.01, raw_lots), 2)
 
     def calculate_max_affordable_lots(self, symbol, action, free_margin, mt5_module=None):
-        """
-        Calculates the maximum lot size that can be opened with available free margin.
-        A safety buffer of 10% is applied to avoid margin calls immediately after entry.
-        """
         if mt5_module is None:
             import MetaTrader5 as mt5_module
 
-        # Start with a reasonable upper bound to check margin (e.g., 100.0 lots)
-        # However, it's better to calculate margin for 1.0 lot and then divide.
         order_type = mt5_module.ORDER_TYPE_BUY if action.upper() == "BUY" else mt5_module.ORDER_TYPE_SELL
         
-        # Get margin required for 1.0 lot
         margin_per_lot = mt5_module.order_calc_margin(order_type, symbol, 1.0, mt5_module.symbol_info_tick(symbol).ask)
         
         if margin_per_lot is None or margin_per_lot <= 0:
             logger.warning(f"Could not calculate margin for {symbol}. Falling back to 0.01 lots.")
             return 0.01
 
-        # Use 90% of free margin as a safety buffer
         affordable_margin = free_margin * 0.9
         max_lots = affordable_margin / margin_per_lot
         
-        # Round down to 2 decimal places to be safe
         max_lots = math.floor(max_lots * 100) / 100.0
         
-        # Standardize to symbol limits
         symbol_info = mt5_module.symbol_info(symbol)
         if symbol_info:
             max_lots = min(max_lots, symbol_info.volume_max)
             max_lots = max(max_lots, symbol_info.volume_min)
             
         return round(max_lots, 2)
+
+class ConsensusEngine:
+    def __init__(self, explorer_brain, guardian_brain, calibrator=None):
+        self.explorer = explorer_brain
+        self.guardian = guardian_brain
+        self.calibrator = calibrator
+        
+    def analyze_mtf_consensus(self, mtf_data, exploration_rate=0.0, symbol="Unknown"):
+        explorer_engine = DecisionEngine(self.explorer, self.calibrator)
+        guardian_engine = DecisionEngine(self.guardian, self.calibrator)
+        
+        exp_signal = explorer_engine.analyze_mtf(mtf_data, ai_mode="EXPLORER", exploration_rate=exploration_rate, symbol=symbol)
+        guard_signal = guardian_engine.analyze_mtf(mtf_data, ai_mode="CONSERVATIVE", exploration_rate=0.0, symbol=symbol)
+        
+        final_signal = exp_signal.copy()
+        
+        if exp_signal['action'] != 'HOLD':
+            guard_conf = guard_signal.get('confidence', 0.0)
+            
+            mismatch = (exp_signal['action'] == 'BUY' and guard_signal['action'] == 'SELL') or \
+                       (exp_signal['action'] == 'SELL' and guard_signal['action'] == 'BUY')
+            
+            GUARDIAN_THRESHOLD = 0.55
+            
+            is_vetoed = False
+            veto_reason = ""
+            
+            if mismatch:
+                is_vetoed = True
+                veto_reason = "Directional Mismatch (Guardian disagrees)"
+            elif guard_signal['action'] == 'HOLD' and guard_conf < GUARDIAN_THRESHOLD:
+                is_vetoed = True
+                veto_reason = f"Guardian Veto: High Uncertainty ({guard_conf:.2f} < {GUARDIAN_THRESHOLD})"
+            elif guard_signal['action'] != exp_signal['action'] and guard_signal['action'] != 'HOLD':
+                is_vetoed = True
+                veto_reason = "Guardian Contradiction"
+
+            if is_vetoed:
+                logger.info(f"🛡️ CONSENSUS VETO for {symbol}: {exp_signal['action']} rejected. Reason: {veto_reason}")
+                final_signal['action'] = 'HOLD'
+                final_signal['reason'] = f"Vetoed: {veto_reason}"
+                final_signal['report'] = f"🛡️ **Guardian Veto**: ปฏิเสธ {exp_signal['action']} เนื่องจาก {veto_reason}"
+            else:
+                final_signal['reason'] = f"Consensus Approved ({exp_signal['action']})"
+                final_signal['report'] = f"🤝 **Consensus Approved**: ทั้ง 2 ขุมพลังเห็นพ้อง (Conf: {exp_signal['confidence']:.2f})"
+
+        return final_signal

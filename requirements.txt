@@ -12,6 +12,7 @@ torch==2.1.0
 torchvision==0.16.0
 scikit-learn==1.3.1
 scikit-image==0.22.0  # For GAF transformation
+optuna==3.4.0
 
 # Database
 psycopg2-binary==2.9.9

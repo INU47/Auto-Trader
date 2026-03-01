@@ -1,9 +1,10 @@
+*.csv
 performance_log.txt
 reset_system.py
 Config/*.json
-AI_Brain/weights/*.pt
-AI_Brain/weights/*/
+AI_Brain/weights
 node_modules/
+cache/
 dist/
 /find_mt5_*.py
 /diag_lots.py
